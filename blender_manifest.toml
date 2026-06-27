@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "pcam_solver"
+version = "1.0.0"
+name = "PCamSolver"
+tagline = "Pseudo 3D camera and object solving from 2D movie clip tracks"
+maintainer = "Naoki Korematsum"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Tracking", "Camera", "3D View"]
