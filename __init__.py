@@ -43,9 +43,9 @@ def pcam_depth_reference_required(props):
     if props.mode == 'CLIP_TRACK':
         if props.apply_to == 'OBJECT':
             return True
-        if props.tripod_mode and props.scale_mode == 'NONE':
+        if props.scale_mode == 'NONE' and props.tripod_mode:
             return False
-        if not props.tripod_mode and props.scale_mode == 'NONE':
+        if props.scale_mode == 'NONE' and not props.tripod_mode:
             return True
         return props.scale_mode in {'Z_DEPTH', 'FOCAL_LENGTH'}
     return False
@@ -91,6 +91,12 @@ def pcam_get_bake_block_reason(context, props):
         return "Active Camera is required."
     if props.apply_to == 'OBJECT' and not props.target_object:
         return "Target Object is required."
+    if (
+        props.apply_to == 'CAMERA' and
+        props.mode in {'ONE_POINT', 'TWO_POINT', 'THREE_POINT'} and
+        cam.location.length_squared <= 1e-12
+    ):
+        return "Move camera from origin."
     if pcam_depth_reference_required(props) and not props.clip_depth_object:
         return "Depth Reference is required."
     if props.use_reference_frame_lock:
@@ -160,24 +166,6 @@ def wrap_pi(angle):
     while angle < -math.pi:
         angle += 2.0 * math.pi
     return angle
-
-def median_value(values):
-    if not values:
-        return None
-    values_sorted = sorted(values)
-    return values_sorted[len(values_sorted) // 2]
-
-def robust_filter_values(values, z_scale=3.5):
-    if len(values) < 5:
-        return values
-    med = median_value(values)
-    deviations = [abs(v - med) for v in values]
-    mad = median_value(deviations)
-    if mad is None or mad < 1e-9:
-        return values
-    sigma = 1.4826 * mad
-    filtered = [v for v in values if abs(v - med) <= z_scale * sigma]
-    return filtered if filtered else values
 
 def frames_with_point_spread(track_data_list, frames, min_dist_sq=1e-12):
     spread_frames = []
@@ -891,6 +879,91 @@ def solve_tripod_pan_tilt_from_rays_strict(ray_ref_list, ray_curr_list, weights=
         return Quaternion()
     return c_curr.normalized().rotation_difference(c_ref.normalized())
 
+def solve_single_ray_pan_tilt(ray_ref, ray_curr):
+    if ray_ref.length_squared < 1e-9 or ray_curr.length_squared < 1e-9:
+        return Quaternion()
+
+    ref = ray_ref.normalized()
+    curr = ray_curr.normalized()
+    cy = curr.y
+    cz = curr.z
+    radius = math.sqrt(cy * cy + cz * cz)
+    if radius < 1e-9:
+        return curr.rotation_difference(ref)
+
+    target_y = max(-radius, min(radius, ref.y))
+    phi = math.atan2(-cz, cy)
+    acos_val = math.acos(max(-1.0, min(1.0, target_y / radius)))
+    candidates = []
+    for tilt in (phi + acos_val, phi - acos_val):
+        tilt = wrap_pi(tilt)
+        tilt_mat = Matrix.Rotation(tilt, 3, 'X')
+        tilted = tilt_mat @ curr
+        ux, uz = tilted.x, tilted.z
+        denom = ux * ux + uz * uz
+        if denom < 1e-9:
+            continue
+        sin_pan = (ref.x * uz - ref.z * ux) / denom
+        cos_pan = (ref.x * ux + ref.z * uz) / denom
+        pan = wrap_pi(math.atan2(sin_pan, cos_pan))
+        pan_tilt = Matrix.Rotation(pan, 3, 'Y') @ tilt_mat
+        solved = pan_tilt @ curr
+        error = (solved - ref).length
+        cost = error + 1e-4 * (abs(pan) + abs(tilt))
+        candidates.append((cost, pan, tilt))
+
+    if not candidates:
+        return curr.rotation_difference(ref)
+    _cost, pan, tilt = min(candidates, key=lambda item: item[0])
+    return (Matrix.Rotation(pan, 3, 'Y') @ Matrix.Rotation(tilt, 3, 'X')).to_quaternion()
+
+def solve_single_ray_euler_y_locked(reference_quat, ray_ref, ray_curr, init_euler, rotation_mode):
+    if ray_ref.length_squared < 1e-9 or ray_curr.length_squared < 1e-9:
+        return reference_quat.copy()
+    if rotation_mode in {'QUATERNION', 'AXIS_ANGLE'}:
+        return reference_quat @ solve_single_ray_pan_tilt(ray_ref, ray_curr)
+
+    target_dir = reference_quat @ ray_ref.normalized()
+    curr = ray_curr.normalized()
+    x = float(init_euler.x)
+    y = float(init_euler.y)
+    z = float(init_euler.z)
+
+    def quat_from_xz(xv, zv):
+        return Euler((xv, y, zv), rotation_mode).to_quaternion()
+
+    def residual(xv, zv):
+        return quat_from_xz(xv, zv) @ curr - target_dir
+
+    eps = 1e-5
+    for _ in range(12):
+        r = residual(x, z)
+        if r.length < 1e-8:
+            break
+        rx = (residual(x + eps, z) - residual(x - eps, z)) / (2.0 * eps)
+        rz = (residual(x, z + eps) - residual(x, z - eps)) / (2.0 * eps)
+        a00 = rx.dot(rx)
+        a01 = rx.dot(rz)
+        a11 = rz.dot(rz)
+        b0 = -rx.dot(r)
+        b1 = -rz.dot(r)
+        det = a00 * a11 - a01 * a01
+        if abs(det) < 1e-12:
+            break
+        dx = (b0 * a11 - b1 * a01) / det
+        dz = (a00 * b1 - a01 * b0) / det
+        dx = max(-0.25, min(0.25, dx))
+        dz = max(-0.25, min(0.25, dz))
+        x = wrap_pi(x + dx)
+        z = wrap_pi(z + dz)
+        if abs(dx) + abs(dz) < 1e-9:
+            break
+
+    solved = quat_from_xz(x, z)
+    old_error = (reference_quat @ (solve_single_ray_pan_tilt(ray_ref, ray_curr) @ curr) - target_dir).length
+    new_error = (solved @ curr - target_dir).length
+    return solved if new_error <= old_error + 1e-5 else reference_quat @ solve_single_ray_pan_tilt(ray_ref, ray_curr)
+
 def solve_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, lock_roll=False, weights=None):
     if not ray_ref_list or not ray_curr_list or len(ray_ref_list) != len(ray_curr_list):
         return Quaternion()
@@ -1200,20 +1273,6 @@ def solve_track_rotation_from_follow_points(track_names, fixed_world_points, cur
         solved_quat = stabilize_camera_roll_step(solved_quat, fallback_quat)
     return solved_quat
 
-def solve_single_track_rotation_from_follow_point(fixed_world_point, current_world_point, cam_loc, ray_origin_loc, ray_origin_quat, fallback_quat):
-    if fixed_world_point is None or current_world_point is None:
-        return fallback_quat.copy()
-    desired_dir = fixed_world_point - cam_loc
-    observed_world = current_world_point - ray_origin_loc
-    if desired_dir.length_squared <= 1e-9 or observed_world.length_squared <= 1e-9:
-        return fallback_quat.copy()
-    observed_local = ray_origin_quat.inverted() @ observed_world.normalized()
-    current_dir = fallback_quat @ observed_local
-    if current_dir.length_squared <= 1e-9:
-        return fallback_quat.copy()
-    correction = current_dir.normalized().rotation_difference(desired_dir.normalized())
-    return correction @ fallback_quat
-
 def build_triangle_basis(points):
     v1 = points[1] - points[0]
     v2 = points[2] - points[0]
@@ -1334,7 +1393,10 @@ def draw_trackers_callback():
                     points_hit.append(hit_loc)
             if hit_loc is None:
                 hit_loc = origin + v_world * 5.0
-                points_miss.append(hit_loc)
+                if obj_eval is None and not pcam_depth_reference_required(props):
+                    points_hit.append(hit_loc)
+                else:
+                    points_miss.append(hit_loc)
             lines.extend([origin, hit_loc])
             
     if not lines:
@@ -3160,6 +3222,37 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
         if cam_data is not None and cam_data.users == 0:
             bpy.data.cameras.remove(cam_data)
 
+    def create_static_follow_depth_plane(self, context, matrix_world, distance=10.0):
+        dist = max(float(distance), 1.0)
+        size = max(dist * 100.0, 1000.0)
+        mesh = bpy.data.meshes.new("PCam_FollowTrack_DepthPlaneMesh")
+        mesh.from_pydata(
+            [
+                (-size, -size, -dist),
+                ( size, -size, -dist),
+                ( size,  size, -dist),
+                (-size,  size, -dist),
+            ],
+            [],
+            [(0, 1, 2, 3)],
+        )
+        mesh.update()
+        plane = bpy.data.objects.new("PCam_FollowTrack_DepthPlane", mesh)
+        context.scene.collection.objects.link(plane)
+        plane.matrix_world = matrix_without_scale(matrix_world)
+        plane.hide_render = True
+        plane.hide_select = True
+        context.view_layer.update()
+        return plane
+
+    def remove_static_follow_depth_plane(self, plane):
+        if plane is None:
+            return
+        mesh = getattr(plane, "data", None)
+        bpy.data.objects.remove(plane, do_unlink=True)
+        if mesh is not None and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
     # Track extraction helpers. Follow Track is still the source of truth for
     # point modes because it preserves Blender's own undistort/depth behavior.
     def estimate_track_group_depth(self, context, cam, clip, tracks, frame, depth_obj):
@@ -3406,123 +3499,55 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
         is_obj = (props.apply_to == 'OBJECT')
         if is_obj:
             return self.execute_one_point_object_follow_track(context, target)
-        cam_ref = context.scene.camera
-        eff_depth_obj = props.clip_depth_object
+        return self.execute_point_none(context, target, [props.track_1], "1-point")
 
-        clip = props.target_clip
-        frame_start = props.bake_start if props.use_custom_range else clip.frame_start + clip.frame_offset
-        frame_end = props.bake_end if props.use_custom_range else clip.frame_start + clip.frame_duration - 1 + clip.frame_offset
-        ref_hint = pcam_get_reference_frame(context, props, frame_start, frame_end)
-        context.scene.frame_set(ref_hint)
-        context.view_layer.update()
-        follow_cam = self.create_static_follow_camera(context, cam_ref, evaluated_matrix_world(context, cam_ref)) if cam_ref else None
+    def project_delta_parallel_to_depth(self, context, delta, depth_obj):
+        if depth_obj is None or delta.length_squared <= 1e-12:
+            return delta.copy()
+        normal = evaluated_matrix_world(context, depth_obj).to_quaternion() @ Vector((0.0, 0.0, 1.0))
+        if normal.length_squared <= 1e-12:
+            return delta.copy()
+        normal.normalize()
+        return delta - normal * delta.dot(normal)
 
-        frame_range = (props.bake_start, props.bake_end) if props.use_custom_range else None
-        keep_existing_position = props.clip_use_existing_position
-        existing_loc_curve = {}
-        location_curve_snapshot = self.snapshot_animation_curves(target, {"location"}) if keep_existing_position else []
-        if keep_existing_position:
-            restore_frame = context.scene.frame_current
-            for f in range(frame_start, frame_end + 1):
-                context.scene.frame_set(f)
-                existing_loc_curve[f] = target.location.copy()
-            context.scene.frame_set(restore_frame)
+    def follow_track_dirs_for_frame(self, track_data, track_names, frame, cam_matrix):
+        cam_inv_rot = cam_matrix.to_quaternion().inverted()
+        cam_loc = cam_matrix.translation
+        dirs = []
+        for index, _track_name in enumerate(track_names):
+            point = track_data[index].get(frame) if index < len(track_data) else None
+            if point is None:
+                continue
+            vec = point - cam_loc
+            if vec.length_squared <= 1e-9:
+                continue
+            dirs.append((cam_inv_rot @ vec).normalized())
+        return dirs
 
-        target_curve_snapshot = self.snapshot_animation_action(target)
-        lens_curve_snapshot = self.snapshot_animation_action(target.data) if getattr(target, "data", None) is not None else []
-        has_existing_focal_keys = self.has_camera_focal_length_keys(cam_ref)
-        has_focal_variation_in_range = frame_range is not None and self.camera_lens_varies_over_range(context, cam_ref, frame_range[0], frame_range[1])
-        pin_existing_focal_range = frame_range is not None and props.scale_mode != 'FOCAL_LENGTH' and (has_existing_focal_keys or has_focal_variation_in_range)
-        pinned_lens_value = float(target.data.lens) if getattr(target, "data", None) is not None else None
-        self.clear_animation_safely(target, frame_range)
-        if pin_existing_focal_range:
-            self.pin_lens_constant_in_range(target.data, frame_range[0], frame_range[1], pinned_lens_value, lens_curve_snapshot)
-        try:
-            t1 = self.extract_track_data(context, follow_cam or cam_ref, props.target_clip, props.track_1, eff_depth_obj, props.use_undistort, props.track_smoothing)
-        finally:
-            self.remove_static_follow_camera(follow_cam)
-        if not t1:
-            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
-            if getattr(target, "data", None) is not None:
-                self.restore_animation_snapshot_exact(target.data, lens_curve_snapshot)
-            self.report({'ERROR'}, "No valid frames found for Track 1 in the bake range.")
-            return {'CANCELLED'}
-            
-        valid_f = sorted(t1.keys())
-        ref_f = pcam_pick_valid_reference_frame(valid_f, ref_hint, props.use_reference_frame_lock)
-        if ref_f is None:
-            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
-            if getattr(target, "data", None) is not None:
-                self.restore_animation_snapshot_exact(target.data, lens_curve_snapshot)
-            self.report({'ERROR'}, "Reference Frame has no valid Track 1 data.")
-            return {'CANCELLED'}
-        context.scene.frame_set(ref_f)
-        if keep_existing_position:
-            target.location = existing_loc_curve.get(ref_f, target.location).copy()
-        
-        init_t_mat = target.matrix_world.copy()
-        init_t_mat = matrix_without_scale(init_t_mat)
-        init_t_loc = init_t_mat.to_translation()
-        init_t_rot = init_t_mat.to_quaternion()
-        p_start = t1.get(ref_f, t1[valid_f[0]])
-        baked_frames = 0
+    def follow_track_points_stuck_at_camera(self, track_data, cam_loc, frames, eps=1e-10):
+        if not track_data:
+            return False
+        total = 0
+        stuck = 0
+        for data in track_data:
+            for frame in frames:
+                point = data.get(frame)
+                if point is None:
+                    continue
+                total += 1
+                if (point - cam_loc).length_squared <= eps:
+                    stuck += 1
+        return total > 0 and stuck == total
 
-        for f in valid_f:
-            context.scene.frame_set(f)
-            p_cur = t1[f]
-            
-            if keep_existing_position:
-                target.location = existing_loc_curve.get(f, init_t_loc.copy()).copy()
-                solved_quat = solve_single_track_rotation_from_follow_point(
-                    p_start,
-                    p_cur,
-                    target.location.copy(),
-                    init_t_loc,
-                    init_t_rot,
-                    init_t_rot,
-                )
-                self.set_target_rotation(target, solved_quat)
-            elif props.tripod_mode:
-                vec_start = p_start - init_t_mat.translation
-                vec_current = p_cur - init_t_mat.translation
-                if vec_start.length_squared > 1e-9 and vec_current.length_squared > 1e-9:
-                    delta_rot = vec_start.rotation_difference(vec_current)
-                    self.set_target_rotation(target, delta_rot.inverted() @ init_t_rot)
-            else:
-                init_c_rot = init_t_mat.to_3x3()
-                delta_pos = p_cur - p_start
-                move_local = init_c_rot.inverted() @ delta_pos
-                move_scaled = Vector((move_local.x, move_local.y, 0.0))
-                target.location = init_t_loc - (init_c_rot @ move_scaled)
-                
-                if props.lock_camera_z:
-                    loc, rot_mat = apply_z_lock(target.location, self.get_target_rotation_matrix(target), p_cur, init_t_loc.z)
-                    target.location = loc
-                    self.set_target_rotation(target, rot_mat)
-                        
-            if not keep_existing_position:
-                target.keyframe_insert("location", frame=f)
-            self.keyframe_target_rotation(target, f)
-            baked_frames += 1
+    def report_follow_track_origin_failure(self, context):
+        cam = context.scene.camera
+        loc = cam.location if cam else Vector((0.0, 0.0, 0.0))
+        if loc.length_squared <= 1e-12:
+            self.report({'ERROR'}, "Follow Track evaluation failed at exact camera origin. Move the camera slightly from (0, 0, 0) and bake again.")
+        else:
+            self.report({'ERROR'}, "Follow Track evaluation stayed at the camera position. Check the camera layout and trackers.")
 
-        if baked_frames == 0:
-            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
-            if getattr(target, "data", None) is not None:
-                self.restore_animation_snapshot_exact(target.data, lens_curve_snapshot)
-            self.report({'ERROR'}, "No frames could be baked from Track 1.")
-            return {'CANCELLED'}
-
-        if keep_existing_position:
-            self.restore_animation_curves(target, location_curve_snapshot)
-        context.scene.frame_set(ref_f)
-        if pin_existing_focal_range:
-            self.pin_lens_constant_in_range(target.data, frame_range[0], frame_range[1], pinned_lens_value, lens_curve_snapshot)
-        total_frames = frame_end - frame_start + 1
-        suffix = f" Solved {baked_frames}/{total_frames} frames." if baked_frames < total_frames else ""
-        self.report({'INFO'}, f"Applied 1-point motion to '{target.name}'.{suffix}")
-        return {'FINISHED'}
-
-    def execute_marker_tripod_none(self, context, target, track_names, label):
+    def execute_point_none(self, context, target, track_names, label):
         props = context.scene.pcam_solve_props
         clip = props.target_clip
         cam_ref = context.scene.camera
@@ -3531,133 +3556,180 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
 
         frame_start = props.bake_start if props.use_custom_range else clip.frame_start + clip.frame_offset
         frame_end = props.bake_end if props.use_custom_range else clip.frame_start + clip.frame_duration - 1 + clip.frame_offset
-        ref_f = pcam_get_reference_frame(context, props, frame_start, frame_end)
+        ref_hint = pcam_get_reference_frame(context, props, frame_start, frame_end)
+        is_tripod = props.tripod_mode
+        if not is_tripod and not props.clip_depth_object:
+            self.report({'ERROR'}, "Depth Reference is required for non-tripod None solving.")
+            return {'CANCELLED'}
 
-        init_t_mat = target.matrix_world.copy()
+        context.scene.frame_set(ref_hint)
+        context.view_layer.update()
+        init_t_mat = matrix_without_scale(target.matrix_world.copy())
         init_t_loc = init_t_mat.to_translation()
         init_t_rot = init_t_mat.to_quaternion()
-        init_rot4 = init_t_rot.to_matrix().to_4x4()
-        tan_x, tan_y = get_camera_tan(cam_ref.data, cam_ref.data.lens, context.scene)
+        init_t_euler = target.rotation_euler.copy()
+        follow_cam = self.create_static_follow_camera(context, cam_ref, init_t_mat) if cam_ref else None
+        extract_cam = follow_cam or cam_ref
+        frame_range = (frame_start, frame_end) if props.use_custom_range else None
+        target_curve_snapshot = self.snapshot_animation_action(target)
+        lens_curve_snapshot = self.snapshot_animation_action(target.data) if getattr(target, "data", None) is not None else []
+        has_existing_focal_keys = self.has_camera_focal_length_keys(cam_ref)
+        has_focal_variation_in_range = self.camera_lens_varies_over_range(context, cam_ref, frame_start, frame_end) if props.use_custom_range else False
+        pin_existing_focal_range = props.use_custom_range and (has_existing_focal_keys or has_focal_variation_in_range)
+        pinned_lens_value = float(target.data.lens) if getattr(target, "data", None) is not None else None
 
-        current_rot_mat = init_rot4.copy()
-        traj_rot = {frame_start: current_rot_mat.copy()}
-        extracted_list = self.extract_tracks_data(
-            context,
-            cam_ref,
-            clip,
-            track_names,
-            None,
-            props.use_undistort,
-            props.track_smoothing,
-        )
-        extracted_tracks = {
-            track_name: track_data
-            for track_name, track_data in zip(track_names, extracted_list)
-        }
-        cam_loc = init_t_mat.to_translation()
+        temp_depth_obj = self.create_static_follow_depth_plane(context, init_t_mat) if is_tripod else None
+        try:
+            track_data = self.extract_tracks_data(
+                context,
+                extract_cam,
+                clip,
+                track_names,
+                temp_depth_obj if is_tripod else props.clip_depth_object,
+                props.use_undistort,
+                props.track_smoothing,
+            )
+        finally:
+            self.remove_static_follow_camera(follow_cam)
+            self.remove_static_follow_depth_plane(temp_depth_obj)
 
-        for f in range(frame_start + 1, frame_end + 1):
-            valid_pairs = []
-            for track_name in track_names:
-                track_data = extracted_tracks.get(track_name, {})
-                p_prev = track_data.get(f - 1)
-                p_curr = track_data.get(f)
-                if p_prev is None or p_curr is None:
-                    continue
-                m_prev = get_track_marker_co(clip, props.tracking_object_idx, track_name, f - 1)
-                m_curr = get_track_marker_co(clip, props.tracking_object_idx, track_name, f)
-                valid_pairs.append((p_prev, p_curr, m_prev, m_curr))
+        if is_tripod:
+            valid_frames = []
+            if track_data:
+                common = set(range(frame_start, frame_end + 1))
+                for data in track_data:
+                    common &= set(data.keys())
+                for f in sorted(common):
+                    dirs = self.follow_track_dirs_for_frame(track_data, track_names, f, init_t_mat)
+                    if len(dirs) == len(track_names):
+                        valid_frames.append(f)
+        else:
+            if not track_data:
+                valid_frames = []
+            else:
+                common = set(range(frame_start, frame_end + 1))
+                for data in track_data:
+                    common &= set(data.keys())
+                valid_frames = sorted(common)
 
-            if len(valid_pairs) >= 2:
-                if len(valid_pairs) >= 3:
-                    motions = [(p_curr - p_prev).length for p_prev, p_curr, _, _ in valid_pairs]
-                    filtered_motions = robust_filter_values(motions)
-                    if len(filtered_motions) != len(motions):
-                        motion_set = list(filtered_motions)
-                        kept_pairs = []
-                        for pair, motion in zip(valid_pairs, motions):
-                            matched = False
-                            for i, filtered_motion in enumerate(motion_set):
-                                if abs(motion - filtered_motion) < 1e-9:
-                                    kept_pairs.append(pair)
-                                    motion_set.pop(i)
-                                    matched = True
-                                    break
-                            if matched:
-                                continue
-                        if len(kept_pairs) >= 2:
-                            valid_pairs = kept_pairs
+        if self.follow_track_points_stuck_at_camera(track_data, init_t_loc, range(frame_start, frame_end + 1)):
+            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
+            if getattr(target, "data", None) is not None:
+                self.restore_animation_snapshot_exact(target.data, lens_curve_snapshot)
+            self.report_follow_track_origin_failure(context)
+            return {'CANCELLED'}
 
-                if props.clip_center_weight:
-                    aspect = tan_x / tan_y if tan_y > 1e-6 else 1.0
-                    weights = [
-                        marker_center_weight(marker_prev, aspect) if marker_prev is not None else 1.0
-                        for _, _, marker_prev, _ in valid_pairs
-                    ]
-                else:
-                    weights = [1.0] * len(valid_pairs)
-                filtered = []
-                filtered_weights = []
-                for pair, weight in zip(valid_pairs, weights):
-                    p_prev, p_curr, marker_prev, marker_curr = pair
-                    v1 = p_prev - cam_loc
-                    v2 = p_curr - cam_loc
-                    if v1.length_squared > 1e-9 and v2.length_squared > 1e-9:
-                        filtered.append((v1.normalized(), v2.normalized(), marker_prev, marker_curr))
-                        filtered_weights.append(weight)
-                v1_list = [v1 for v1, _, _, _ in filtered]
-                v2_list = [v2 for _, v2, _, _ in filtered]
-                valid_pairs = [(None, None, mp, mc) for _, _, mp, mc in filtered]
-                weights = filtered_weights
+        ref_f = pcam_pick_valid_reference_frame(valid_frames, ref_hint, props.use_reference_frame_lock)
+        if ref_f is None:
+            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
+            if getattr(target, "data", None) is not None:
+                self.restore_animation_snapshot_exact(target.data, lens_curve_snapshot)
+            if init_t_loc.length_squared <= 1e-12:
+                self.report_follow_track_origin_failure(context)
+            else:
+                self.report({'ERROR'}, f"Reference Frame has no valid {label} tracker data.")
+            return {'CANCELLED'}
 
-                c1_3d = sum((v * w for v, w in zip(v1_list, weights)), Vector((0.0, 0.0, 0.0)))
-                c2_3d = sum((v * w for v, w in zip(v2_list, weights)), Vector((0.0, 0.0, 0.0)))
-                if c1_3d.length_squared > 1e-9 and c2_3d.length_squared > 1e-9:
-                    c1_3d.normalize()
-                    c2_3d.normalize()
-
-                    q_pt = c2_3d.rotation_difference(c1_3d)
-                    e_pt = q_pt.to_euler('XYZ')
-                    tilt_angle = e_pt.x
-                    pan_angle = e_pt.y
-
-                    delta_roll = 0.0
-                    if not props.clip_lock_roll:
-                        v2_aligned = [q_pt @ v for v in v2_list]
-                        angles = []
-                        valid_weights = []
-                        for v1, v2_a, w in zip(v1_list, v2_aligned, weights):
-                            v1_proj = v1 - v1.project(c1_3d)
-                            v2_proj = v2_a - v2_a.project(c1_3d)
-                            if v1_proj.length_squared > 1e-6 and v2_proj.length_squared > 1e-6:
-                                cross = v2_proj.cross(v1_proj)
-                                sign = -1.0 if cross.dot(c1_3d) > 0 else 1.0
-                                angles.append(v2_proj.angle(v1_proj) * sign)
-                                valid_weights.append(w)
-                        if angles and sum(valid_weights) > 1e-6:
-                            delta_roll = sum(a * w for a, w in zip(angles, valid_weights)) / sum(valid_weights)
-
-                    roll_angle = delta_roll
-                    mat_x = Matrix.Rotation(tilt_angle, 4, 'X')
-                    mat_y = Matrix.Rotation(pan_angle, 4, 'Y')
-                    mat_z = Matrix.Rotation(roll_angle, 4, 'Z')
-                    current_rot_mat = current_rot_mat @ (mat_y @ mat_x @ mat_z)
-
-            traj_rot[f] = current_rot_mat.copy()
-
-        m_align = init_rot4 @ traj_rot[ref_f].inverted()
         self.clear_animation_safely(target, (frame_start, frame_end) if props.use_custom_range else None)
+        if pin_existing_focal_range and getattr(target, "data", None):
+            self.pin_lens_constant_in_range(target.data, frame_start, frame_end, pinned_lens_value, lens_curve_snapshot)
 
+        ref_points = None
+        ref_rays = None
+        ref_weights = None
+        if is_tripod:
+            ref_rays = self.follow_track_dirs_for_frame(track_data, track_names, ref_f, init_t_mat)
+            ref_weights = [1.0] * len(ref_rays)
+        else:
+            ref_points = [data[ref_f].copy() for data in track_data]
+            ref_center = sum(ref_points, Vector()) / len(ref_points)
+
+        baked_frames = 0
         for f in range(frame_start, frame_end + 1):
+            if f not in valid_frames:
+                continue
             context.scene.frame_set(f)
-            f_rot = m_align @ traj_rot[f]
-            target.location = init_t_loc
-            self.set_target_rotation(target, f_rot)
+            if is_tripod:
+                curr_rays = self.follow_track_dirs_for_frame(track_data, track_names, f, init_t_mat)
+                weights = [1.0] * len(curr_rays)
+                usable_count = min(len(ref_rays), len(curr_rays), len(weights))
+                if usable_count <= 0:
+                    continue
+                lock_roll_for_mode = props.clip_lock_roll or len(track_names) < 2
+                if len(track_names) < 2:
+                    solved_quat = solve_single_ray_euler_y_locked(
+                        init_t_rot,
+                        ref_rays[0],
+                        curr_rays[0],
+                        init_t_euler,
+                        target.rotation_mode,
+                    )
+                else:
+                    if lock_roll_for_mode:
+                        weight_sum = sum(weights[:usable_count])
+                        if weight_sum <= 1e-9:
+                            continue
+                        ref_center_ray = sum(
+                            (ray * weight for ray, weight in zip(ref_rays[:usable_count], weights[:usable_count])),
+                            Vector((0.0, 0.0, 0.0)),
+                        ) / weight_sum
+                        curr_center_ray = sum(
+                            (ray * weight for ray, weight in zip(curr_rays[:usable_count], weights[:usable_count])),
+                            Vector((0.0, 0.0, 0.0)),
+                        ) / weight_sum
+                        solved_quat = solve_single_ray_euler_y_locked(
+                            init_t_rot,
+                            ref_center_ray,
+                            curr_center_ray,
+                            init_t_euler,
+                            target.rotation_mode,
+                        )
+                    else:
+                        delta_quat = solve_weighted_kabsch_rotation(
+                            ref_rays[:usable_count],
+                            curr_rays[:usable_count],
+                            False,
+                            weights[:usable_count],
+                        )
+                        solved_quat = init_t_rot @ delta_quat
+                target.location = init_t_loc
+                self.set_target_rotation(target, solved_quat)
+            else:
+                curr_points = [data[f].copy() for data in track_data]
+                curr_center = sum(curr_points, Vector()) / len(curr_points)
+                delta = self.project_delta_parallel_to_depth(context, curr_center - ref_center, props.clip_depth_object)
+                target.location = init_t_loc - delta
+                solved_quat = init_t_rot
+                if len(track_names) >= 2 and not props.clip_lock_roll:
+                    init_inv = init_t_mat.inverted()
+                    init_rot_inv = init_t_rot.inverted()
+                    ref_xy = []
+                    curr_xy = []
+                    for ref_point, curr_point in zip(ref_points, curr_points):
+                        ref_local = init_inv @ ref_point
+                        curr_local = init_rot_inv @ (curr_point - target.location)
+                        ref_xy.append(Vector((ref_local.x, ref_local.y)))
+                        curr_xy.append(Vector((curr_local.x, curr_local.y)))
+                    roll_delta = solve_planar_roll_from_points(ref_xy, curr_xy)
+                    if abs(roll_delta) > 1e-9:
+                        axis = init_t_rot @ Vector((0.0, 0.0, 1.0))
+                        solved_quat = Quaternion(axis, -roll_delta) @ init_t_rot
+                self.set_target_rotation(target, solved_quat)
             target.keyframe_insert("location", frame=f)
             self.keyframe_target_rotation(target, f)
+            baked_frames += 1
+
+        if baked_frames == 0:
+            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
+            if getattr(target, "data", None) is not None:
+                self.restore_animation_snapshot_exact(target.data, lens_curve_snapshot)
+            self.report({'ERROR'}, f"No frames could be baked from {label} trackers.")
+            return {'CANCELLED'}
 
         context.scene.frame_set(ref_f)
-        self.report({'INFO'}, f"Applied {label} tripod motion to '{target.name}'.")
+        total_frames = frame_end - frame_start + 1
+        suffix = f" Solved {baked_frames}/{total_frames} frames." if baked_frames < total_frames else ""
+        self.report({'INFO'}, f"Applied {label} None motion to '{target.name}'.{suffix}")
         return {'FINISHED'}
 
     def execute_two_point(self, context, target):
@@ -3671,8 +3743,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
             
         is_obj = (props.apply_to == 'OBJECT')
         cam_ref = context.scene.camera
-        if not is_obj and props.tripod_mode and props.scale_mode == 'NONE':
-            return self.execute_marker_tripod_none(context, target, [props.track_1, props.track_2], "2-point")
+        if not is_obj and props.scale_mode == 'NONE':
+            return self.execute_point_none(context, target, [props.track_1, props.track_2], "2-point")
         eff_depth_obj = props.clip_depth_object if props.clip_depth_object else (target if is_obj else None)
 
         clip = props.target_clip
@@ -3681,7 +3753,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
         ref_hint = pcam_get_reference_frame(context, props, frame_start, frame_end)
         context.scene.frame_set(ref_hint)
         context.view_layer.update()
-        follow_cam = self.create_static_follow_camera(context, cam_ref, evaluated_matrix_world(context, cam_ref)) if cam_ref and not is_obj else None
+        ref_cam_mat = matrix_without_scale(evaluated_matrix_world(context, cam_ref)) if cam_ref else None
+        follow_cam = self.create_static_follow_camera(context, cam_ref, ref_cam_mat) if cam_ref and not is_obj else None
 
         frame_range = (props.bake_start, props.bake_end) if props.use_custom_range else None
         keep_existing_position = (not is_obj) and props.clip_use_existing_position and not (props.tripod_mode and props.scale_mode == 'FOCAL_LENGTH')
@@ -4073,8 +4146,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
             
         is_obj = (props.apply_to == 'OBJECT')
         cam_ref = context.scene.camera
-        if not is_obj and props.tripod_mode and props.scale_mode == 'NONE':
-            return self.execute_marker_tripod_none(context, target, [props.track_1, props.track_2, props.track_3], "3-point")
+        if not is_obj and props.scale_mode == 'NONE':
+            return self.execute_point_none(context, target, [props.track_1, props.track_2, props.track_3], "3-point")
         eff_scale_mode = 'Z_DEPTH' if is_obj and props.scale_mode != 'NONE' else props.scale_mode
         eff_depth_obj = props.clip_depth_object if props.clip_depth_object else (target if is_obj else None)
 
@@ -4084,7 +4157,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
         ref_hint = pcam_get_reference_frame(context, props, frame_start, frame_end)
         context.scene.frame_set(ref_hint)
         context.view_layer.update()
-        follow_cam = self.create_static_follow_camera(context, cam_ref, evaluated_matrix_world(context, cam_ref)) if cam_ref and not is_obj else None
+        ref_cam_mat = matrix_without_scale(evaluated_matrix_world(context, cam_ref)) if cam_ref else None
+        follow_cam = self.create_static_follow_camera(context, cam_ref, ref_cam_mat) if cam_ref and not is_obj else None
 
         frame_range = (props.bake_start, props.bake_end) if props.use_custom_range else None
         keep_existing_position = (not is_obj) and props.clip_use_existing_position and not (props.tripod_mode and props.scale_mode == 'FOCAL_LENGTH')
