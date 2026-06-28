@@ -647,7 +647,7 @@ def get_track_marker_co(clip, tracking_object_idx, track_name, scene_frame):
         return None
     return get_track_display_co(track, marker)
 
-def solve_focal_tripod_lock_roll_from_markers(context, cam_data, clip, tracking_object_idx, track_names, ref_frame, frame, ref_lens, frame_lens):
+def solve_focal_tripod_rotation_from_markers(context, cam_data, clip, tracking_object_idx, track_names, ref_frame, frame, ref_lens, frame_lens, lock_roll=False):
     tan_ref_x, tan_ref_y = get_camera_tan(cam_data, ref_lens, context.scene)
     tan_frame_x, tan_frame_y = get_camera_tan(cam_data, frame_lens, context.scene)
     ray_ref_list = []
@@ -663,7 +663,35 @@ def solve_focal_tripod_lock_roll_from_markers(context, cam_data, clip, tracking_
 
     if len(ray_ref_list) < 1:
         return None
-    return solve_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, True)
+    if lock_roll or len(ray_ref_list) < 2:
+        return solve_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, True)
+
+    pan_tilt_quat = solve_tripod_pan_tilt_from_rays(ray_ref_list, ray_curr_list)
+    if pan_tilt_quat == Quaternion():
+        return Quaternion()
+
+    c_ref = sum(ray_ref_list, Vector((0.0, 0.0, 0.0)))
+    if c_ref.length_squared < 1e-9:
+        return pan_tilt_quat
+    c_ref.normalize()
+
+    curr_aligned = [pan_tilt_quat @ ray for ray in ray_curr_list]
+    angles = []
+    valid_weights = []
+    for ray_ref, ray_curr_aligned in zip(ray_ref_list, curr_aligned):
+        ref_proj = ray_ref - ray_ref.project(c_ref)
+        curr_proj = ray_curr_aligned - ray_curr_aligned.project(c_ref)
+        if ref_proj.length_squared > 1e-6 and curr_proj.length_squared > 1e-6:
+            cross = curr_proj.cross(ref_proj)
+            sign = -1.0 if cross.dot(c_ref) > 0 else 1.0
+            angles.append(curr_proj.angle(ref_proj) * sign)
+            valid_weights.append(ref_proj.length_squared)
+
+    if not angles or sum(valid_weights) <= 1e-6:
+        return pan_tilt_quat
+
+    delta_roll = sum(a * w for a, w in zip(angles, valid_weights)) / sum(valid_weights)
+    return Quaternion(c_ref, -delta_roll) @ pan_tilt_quat
 
 # --- Rotation Solver Helpers ---
 
@@ -1047,6 +1075,53 @@ def raycast_marker_world(context, cam, depth_obj, marker_co):
         return obj_eval.matrix_world @ loc
     return None
 
+def raycast_marker_world_from_matrix(context, cam_data, cam_matrix, depth_obj, marker_co, lens_value):
+    if cam_data is None or depth_obj is None:
+        return None
+
+    depsgraph = context.evaluated_depsgraph_get()
+    obj_eval = depth_obj.evaluated_get(depsgraph)
+    origin = cam_matrix.translation
+    tan_x, tan_y = get_camera_tan(cam_data, lens_value, context.scene)
+    v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y)
+    v_world = cam_matrix.to_3x3() @ v_cam
+
+    mat_inv = obj_eval.matrix_world.inverted()
+    ray_origin = mat_inv @ origin
+    dir_loc = (mat_inv.to_3x3() @ v_world).normalized()
+    success, loc, normal, face_index = obj_eval.ray_cast(ray_origin, dir_loc)
+    if success:
+        return obj_eval.matrix_world @ loc
+    return None
+
+def map_anchor_by_segment_in_camera_space(p1_start, p2_start, p1_curr, p2_curr, anchor_start, cam_matrix):
+    cam_inv = cam_matrix.inverted()
+    s1 = cam_inv @ p1_start
+    s2 = cam_inv @ p2_start
+    c1 = cam_inv @ p1_curr
+    c2 = cam_inv @ p2_curr
+    anchor = cam_inv @ anchor_start
+
+    start_mid = (s1 + s2) * 0.5
+    curr_mid = (c1 + c2) * 0.5
+    start_vec = Vector((s2.x - s1.x, s2.y - s1.y))
+    curr_vec = Vector((c2.x - c1.x, c2.y - c1.y))
+    if start_vec.length_squared < 1e-9 or curr_vec.length_squared < 1e-9:
+        return None
+
+    start_x = start_vec.normalized()
+    start_y = Vector((-start_x.y, start_x.x))
+    curr_x = curr_vec.normalized()
+    curr_y = Vector((-curr_x.y, curr_x.x))
+    scale = curr_vec.length / start_vec.length
+
+    offset = Vector((anchor.x - start_mid.x, anchor.y - start_mid.y))
+    u = offset.dot(start_x)
+    v = offset.dot(start_y)
+    curr_xy = Vector((curr_mid.x, curr_mid.y)) + (curr_x * u + curr_y * v) * scale
+    curr_z = curr_mid.z + (anchor.z - start_mid.z) * scale
+    return cam_matrix @ Vector((curr_xy.x, curr_xy.y, curr_z))
+
 def refine_rotation_center_alignment(base_quat, desired_dirs, observed_rays, weights=None):
     if base_quat == Quaternion() or not desired_dirs or not observed_rays or len(desired_dirs) != len(observed_rays):
         return base_quat
@@ -1148,6 +1223,21 @@ def build_triangle_basis(points):
     x_axis = v1.normalized()
     y_axis = z_axis.cross(x_axis).normalized()
     return Matrix((x_axis, y_axis, z_axis)).transposed()
+
+def camera_axis_plane_anchor(points, cam_loc, cam_quat):
+    if len(points) < 3:
+        return None
+    normal = (points[1] - points[0]).cross(points[2] - points[0])
+    if normal.length_squared < 1e-9:
+        return None
+    forward = cam_quat @ Vector((0.0, 0.0, -1.0))
+    denom = normal.dot(forward)
+    if abs(denom) < 1e-9:
+        return None
+    distance = normal.dot(points[0] - cam_loc) / denom
+    if distance <= 1e-6:
+        return None
+    return cam_loc + forward * distance
 
 def apply_z_lock(ideal_loc, ideal_rot_mat, target_point, initial_z):
     locked_loc = ideal_loc.copy()
@@ -3692,6 +3782,16 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
         depth_ref_mat = evaluated_matrix_world(context, props.clip_depth_object) if is_obj and props.clip_depth_object else None
         depth_ref_inv = depth_ref_mat.inverted() if depth_ref_mat is not None else None
         depth_ref_quat_inv = depth_ref_mat.to_quaternion().inverted() if depth_ref_mat is not None else None
+        camera_anchor_start = None
+        if not is_obj and props.clip_depth_object:
+            camera_anchor_start = raycast_marker_world_from_matrix(
+                context,
+                cam_ref.data,
+                init_t_mat,
+                props.clip_depth_object,
+                Vector((0.5, 0.5)),
+                init_f_len,
+            )
         baked_frames = 0
         skip_counts = {
             "zero_pair": 0,
@@ -3708,10 +3808,24 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
             if vec_curr.length_squared == 0:
                 skip_counts["zero_pair"] += 1
                 continue
+            center_start = (p1_start + p2_start) / 2.0
+            center_curr = (p1_curr + p2_curr) / 2.0
+            camera_anchor_from = center_start
+            camera_anchor_to = center_curr
+            if not is_obj and camera_anchor_start is not None:
+                mapped_anchor = map_anchor_by_segment_in_camera_space(
+                    p1_start,
+                    p2_start,
+                    p1_curr,
+                    p2_curr,
+                    camera_anchor_start,
+                    init_t_mat,
+                )
+                if mapped_anchor is not None:
+                    camera_anchor_from = camera_anchor_start
+                    camera_anchor_to = mapped_anchor
                 
             if is_obj:
-                center_start = (p1_start + p2_start) / 2.0
-                center_curr = (p1_curr + p2_curr) / 2.0
                 target.location = init_t_loc + (center_curr - center_start)
                 
                 delta_rot_quat = vec_start.rotation_difference(vec_curr)
@@ -3768,8 +3882,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                             solved_quat = preserve_camera_roll_from_reference(solved_quat, init_t_rot)
                         self.set_target_rotation(target, solved_quat)
                     else:
-                        solved_focal_lock_roll = False
-                        if props.scale_mode == 'FOCAL_LENGTH' and props.clip_lock_roll:
+                        solved_focal_rotation = False
+                        if props.scale_mode == 'FOCAL_LENGTH':
                             ref_lens_for_rotation = existing_lens_curve.get(ref_f, init_f_len) if keep_existing_focal else init_f_len
                             if keep_existing_focal:
                                 frame_lens_for_rotation = existing_lens_curve.get(f, ref_lens_for_rotation)
@@ -3777,7 +3891,7 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                                 frame_lens_for_rotation = init_f_len
                             else:
                                 frame_lens_for_rotation = init_f_len * scale_ratio
-                            delta_quat = solve_focal_tripod_lock_roll_from_markers(
+                            delta_quat = solve_focal_tripod_rotation_from_markers(
                                 context,
                                 cam_ref.data,
                                 props.target_clip,
@@ -3787,19 +3901,20 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                                 f,
                                 ref_lens_for_rotation,
                                 frame_lens_for_rotation,
+                                props.clip_lock_roll,
                             )
                             if delta_quat is not None:
                                 target.location = init_t_loc
-                                solved_quat = preserve_camera_roll_from_reference(init_t_rot @ delta_quat, init_t_rot)
+                                solved_quat = init_t_rot @ delta_quat
+                                if props.clip_lock_roll:
+                                    solved_quat = preserve_camera_roll_from_reference(solved_quat, init_t_rot)
                                 self.set_target_rotation(target, solved_quat)
-                                solved_focal_lock_roll = True
+                                solved_focal_rotation = True
 
-                        if not solved_focal_lock_roll:
-                            center_start = (p1_start + p2_start) / 2.0
-                            center_curr = (p1_curr + p2_curr) / 2.0
-                            vec_pt_start = center_start - target.location
+                        if not solved_focal_rotation:
+                            vec_pt_start = camera_anchor_from - target.location
                             init_cam_matrix_inv = init_t_mat.inverted()
-                            center_local_curr = init_cam_matrix_inv @ center_curr
+                            center_local_curr = init_cam_matrix_inv @ camera_anchor_to
                             center_local_curr_unzoomed = Vector((
                                 center_local_curr.x / scale_ratio if scale_ratio > 1e-6 else center_local_curr.x,
                                 center_local_curr.y / scale_ratio if scale_ratio > 1e-6 else center_local_curr.y,
@@ -3831,9 +3946,6 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                             self.set_target_rotation(target, solved_quat)
                     
                 else: # Non-Tripod
-                    center_start = (p1_start + p2_start) / 2.0
-                    center_curr = (p1_curr + p2_curr) / 2.0
-                    
                     init_rot_quat, init_cam_rot_mat = init_t_mat.to_quaternion(), init_t_mat.to_3x3()
                     
                     vec_start_local = init_cam_rot_mat.inverted() @ vec_start
@@ -3854,8 +3966,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                     self.set_target_rotation(target, correction_quat @ init_rot_quat)
                     
                     init_cam_matrix_inv = init_t_mat.inverted()
-                    center_start_local = init_cam_matrix_inv @ center_start
-                    center_curr_local = init_cam_matrix_inv @ center_curr
+                    center_start_local = init_cam_matrix_inv @ camera_anchor_from
+                    center_curr_local = init_cam_matrix_inv @ camera_anchor_to
                     center_curr_local_unzoomed = Vector((
                         center_curr_local.x / scale_ratio_for_pan if scale_ratio_for_pan > 1e-6 else center_curr_local.x,
                         center_curr_local.y / scale_ratio_for_pan if scale_ratio_for_pan > 1e-6 else center_curr_local.y,
@@ -3876,8 +3988,7 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                         self.set_target_rotation(target, rot_mat)
 
                 if props.scale_mode == 'Z_DEPTH':
-                    center_start = (p1_start + p2_start) / 2.0
-                    depth_start = (center_start - init_t_loc).length
+                    depth_start = (camera_anchor_from - init_t_loc).length
                     depth_curr = depth_start / scale_ratio if scale_ratio > 1e-6 else depth_start
                     if props.tripod_mode:
                         view_dir = self.get_target_rotation_quaternion(target) @ Vector((0,0,-1))
@@ -4128,6 +4239,10 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
             
             transform_matrix = mat_trans_from_origin @ mat_rot @ mat_scale @ mat_trans_to_origin
             transform_matrix_noscale = mat_trans_from_origin @ mat_rot @ mat_trans_to_origin
+            camera_anchor_from = camera_axis_plane_anchor(points_start, init_t_loc, init_t_rot) if not is_obj else None
+            if camera_anchor_from is None:
+                camera_anchor_from = centroid_from
+            camera_anchor_to = transform_matrix @ camera_anchor_from
 
             if is_obj:
                 center_start = centroid_from
@@ -4206,35 +4321,43 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
 
                     if props.tripod_mode:
                         target.location = init_t_loc
-                        solved_focal_lock_roll = False
-                        if props.clip_lock_roll:
-                            ref_lens_for_rotation = existing_lens_curve.get(ref_f, init_f_len) if keep_existing_focal else init_f_len
-                            if keep_existing_focal:
-                                frame_lens_for_rotation = existing_lens_curve.get(f, ref_lens_for_rotation)
-                            elif suppress_focal_bake:
-                                frame_lens_for_rotation = init_f_len
-                            else:
-                                frame_lens_for_rotation = init_f_len * scale_ratio
-                            delta_quat = solve_focal_tripod_lock_roll_from_markers(
-                                context,
-                                cam_ref.data,
-                                props.target_clip,
-                                props.tracking_object_idx,
-                                [props.track_1, props.track_2, props.track_3],
-                                ref_f,
-                                f,
-                                ref_lens_for_rotation,
-                                frame_lens_for_rotation,
-                            )
-                            if delta_quat is not None:
-                                solved_quat = preserve_camera_roll_from_reference(init_t_rot @ delta_quat, init_t_rot)
-                                self.set_target_rotation(target, solved_quat)
-                                solved_focal_lock_roll = True
+                        solved_focal_rotation = False
+                        ref_lens_for_rotation = existing_lens_curve.get(ref_f, init_f_len) if keep_existing_focal else init_f_len
+                        if keep_existing_focal:
+                            frame_lens_for_rotation = existing_lens_curve.get(f, ref_lens_for_rotation)
+                        elif suppress_focal_bake:
+                            frame_lens_for_rotation = init_f_len
+                        else:
+                            frame_lens_for_rotation = init_f_len * scale_ratio
+                        delta_quat = solve_focal_tripod_rotation_from_markers(
+                            context,
+                            cam_ref.data,
+                            props.target_clip,
+                            props.tracking_object_idx,
+                            [props.track_1, props.track_2, props.track_3],
+                            ref_f,
+                            f,
+                            ref_lens_for_rotation,
+                            frame_lens_for_rotation,
+                            props.clip_lock_roll,
+                        )
+                        if delta_quat is not None:
+                            solved_quat = init_t_rot @ delta_quat
+                            if props.clip_lock_roll:
+                                solved_quat = preserve_camera_roll_from_reference(solved_quat, init_t_rot)
+                            self.set_target_rotation(target, solved_quat)
+                            solved_focal_rotation = True
 
-                        if not solved_focal_lock_roll:
-                            centroid_curr_unzoomed = sum(points_curr_unzoomed, Vector()) / 3.0
-                            vec_pt_start = centroid_from - init_t_loc
-                            vec_pt_curr_unzoomed = centroid_curr_unzoomed - init_t_loc
+                        if not solved_focal_rotation:
+                            anchor_curr_local = init_cam_inv @ camera_anchor_to
+                            anchor_curr_local_unzoomed = Vector((
+                                anchor_curr_local.x / scale_ratio if scale_ratio > 1e-6 else anchor_curr_local.x,
+                                anchor_curr_local.y / scale_ratio if scale_ratio > 1e-6 else anchor_curr_local.y,
+                                anchor_curr_local.z
+                            ))
+                            anchor_curr_unzoomed = init_t_mat @ anchor_curr_local_unzoomed
+                            vec_pt_start = camera_anchor_from - init_t_loc
+                            vec_pt_curr_unzoomed = anchor_curr_unzoomed - init_t_loc
                             if vec_pt_start.length_squared < 1e-9 or vec_pt_curr_unzoomed.length_squared < 1e-9:
                                 skip_counts["zero_focal_view"] += 1
                                 continue
@@ -4255,8 +4378,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                                 solved_quat = preserve_camera_roll_from_reference(solved_quat, init_t_rot)
                             self.set_target_rotation(target, solved_quat)
                     else:
-                        centroid_start_local = init_cam_inv @ centroid_from
-                        centroid_curr_local = init_cam_inv @ centroid_to
+                        centroid_start_local = init_cam_inv @ camera_anchor_from
+                        centroid_curr_local = init_cam_inv @ camera_anchor_to
                         centroid_curr_local_unzoomed = Vector((
                             centroid_curr_local.x / scale_ratio if scale_ratio > 1e-6 else centroid_curr_local.x,
                             centroid_curr_local.y / scale_ratio if scale_ratio > 1e-6 else centroid_curr_local.y,
@@ -4288,6 +4411,35 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                     if not keep_existing_focal and not suppress_focal_bake:
                         target.data.lens = init_f_len * scale_ratio
                         target.data.keyframe_insert(data_path="lens", frame=f)
+                    lens_for_rotation = (
+                        existing_lens_curve.get(f, init_f_len) if keep_existing_focal else
+                        init_f_len if suppress_focal_bake else
+                        init_f_len * scale_ratio
+                    )
+                    marker_curr_list = [
+                        get_track_marker_co(props.target_clip, props.tracking_object_idx, props.track_1, f),
+                        get_track_marker_co(props.target_clip, props.tracking_object_idx, props.track_2, f),
+                        get_track_marker_co(props.target_clip, props.tracking_object_idx, props.track_3, f),
+                    ]
+                    if not any(marker is None for marker in marker_curr_list):
+                        tan_x, tan_y = get_camera_tan(cam_ref.data, lens_for_rotation, context.scene)
+                        rays_local = [marker_to_camera_ray(marker, tan_x, tan_y) for marker in marker_curr_list]
+                        weights = None
+                        if props.clip_center_weight:
+                            aspect = tan_x / tan_y if tan_y > 1e-6 else 1.0
+                            weights = [marker_center_weight(marker, aspect) for marker in marker_curr_list]
+                        refined_quat = solve_rotation_quat_at_location(
+                            points_start_ref,
+                            rays_local,
+                            target.location.copy(),
+                            self.get_target_rotation_quaternion(target),
+                            props.clip_lock_roll,
+                            weights,
+                            prefer_center=True,
+                        )
+                        if props.clip_lock_roll:
+                            refined_quat = preserve_camera_roll_from_reference(refined_quat, init_t_rot)
+                        self.set_target_rotation(target, refined_quat)
                 else:
                     if props.tripod_mode:
                         if props.scale_mode == 'NONE':
@@ -4327,8 +4479,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                                     props.clip_lock_roll,
                                 )
                             elif props.clip_lock_roll:
-                                vec_pt_start = centroid_from - init_t_loc
-                                vec_pt_curr = centroid_to - init_t_loc
+                                vec_pt_start = camera_anchor_from - init_t_loc
+                                vec_pt_curr = camera_anchor_to - init_t_loc
                                 if vec_pt_start.length_squared > 1e-9 and vec_pt_curr.length_squared > 1e-9:
                                     delta_quat = vec_pt_start.rotation_difference(vec_pt_curr)
                             target.location = init_t_loc
@@ -4363,8 +4515,8 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                         
                         loc, rot, sca = new_matrix.decompose()
                         self.set_target_rotation(target, rot)
-                        centroid_start_local = init_cam_inv @ centroid_from
-                        centroid_curr_local = init_cam_inv @ centroid_to
+                        centroid_start_local = init_cam_inv @ camera_anchor_from
+                        centroid_curr_local = init_cam_inv @ camera_anchor_to
                         centroid_curr_local_unzoomed = Vector((
                             centroid_curr_local.x / scale_ratio if scale_ratio > 1e-6 else centroid_curr_local.x,
                             centroid_curr_local.y / scale_ratio if scale_ratio > 1e-6 else centroid_curr_local.y,
@@ -4384,7 +4536,7 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, bpy.ty
                         self.set_target_rotation(target, rot_mat)
 
                     if props.scale_mode == 'Z_DEPTH':
-                        depth_start = (centroid_from - init_t_mat.to_translation()).length
+                        depth_start = (camera_anchor_from - init_t_mat.to_translation()).length
                         depth_curr = depth_start / scale_ratio if scale_ratio > 1e-6 else depth_start
                         if props.tripod_mode:
                             view_dir = self.get_target_rotation_quaternion(target) @ Vector((0,0,-1))
