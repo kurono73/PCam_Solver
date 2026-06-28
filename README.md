@@ -143,10 +143,11 @@ If necessary, smooth or edit the baked curves manually. You can then use `Use Ex
 * Before baking, roughly align the camera position and rotation on the **Reference Frame**. This usually produces more predictable results.
 * PCamSolver does not estimate the real camera focal length or lens parameters. Set the camera focal length and sensor settings before baking.
 * In **Focal Length** mode, the focal length on the **Reference Frame** is used as the base value for the solved animation.
-* In **1 Point**, **2 Point**, and **3 Point** modes, the selected trackers should remain valid throughout the bake range.
+* In **1/2/3 Point** camera modes, the camera cannot be exactly at the world origin. Move the camera slightly away from `(0, 0, 0)` before baking.
+* In **1/2/3 Point** modes, the selected trackers should remain valid throughout the bake range.
 * If trackers appear or disappear during the shot, consider using **Clip Track** mode. You can also solve shorter sections with **Custom Range** and use different trackers for each section.
 * **Preview Tracker Raycast** is intended to help place the **Depth Reference**. It does not display undistorted tracker positions.
 * Make sure the **Depth Reference** covers the full movement range of the trackers used for the solve. A simple plane usually provides the most stable and predictable results.
 * In Object mode, animated rotation on the **Depth Reference** can be used as a simple guide for depth-related object rotation. Use **Preview Tracker Raycast** to verify that tracker rays remain inside the Depth Reference. Large rotations or insufficient coverage may produce unstable results.
 * Dolly zoom shots are not directly supported. PCamSolver can interpret apparent scale changes as either depth movement or focal length animation, but it cannot separate both simultaneously.
-
+* In Object target modes, place the Depth Reference near the depth of the target object's origin on the Reference Frame. 
