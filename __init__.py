@@ -31,7 +31,7 @@ def register():
 
 def unregister():
     remove_preview_handler()
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
     if hasattr(bpy.types.Scene, "pcam_solve_props"):
         del bpy.types.Scene.pcam_solve_props
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)

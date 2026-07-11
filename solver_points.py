@@ -529,12 +529,12 @@ class PCamPointSolver:
                             skip_counts["missing_marker"] += 1
                             continue
                         ray_ref_list = [
-                            marker_to_camera_ray(marker_ref_1, tan_x, tan_y),
-                            marker_to_camera_ray(marker_ref_2, tan_x, tan_y),
+                            marker_to_camera_ray(marker_ref_1, tan_x, tan_y, cam_ref.data),
+                            marker_to_camera_ray(marker_ref_2, tan_x, tan_y, cam_ref.data),
                         ]
                         ray_curr_list = [
-                            marker_to_camera_ray(marker_cur_1, tan_x, tan_y),
-                            marker_to_camera_ray(marker_cur_2, tan_x, tan_y),
+                            marker_to_camera_ray(marker_cur_1, tan_x, tan_y, cam_ref.data),
+                            marker_to_camera_ray(marker_cur_2, tan_x, tan_y, cam_ref.data),
                         ]
                         delta_quat = solve_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, props.clip_lock_roll)
                         solved_quat = delta_quat @ init_t_rot
@@ -1086,7 +1086,7 @@ class PCamPointSolver:
                     ]
                     if not any(marker is None for marker in marker_curr_list):
                         tan_x, tan_y = get_camera_tan(cam_ref.data, lens_for_rotation, context.scene)
-                        rays_local = [marker_to_camera_ray(marker, tan_x, tan_y) for marker in marker_curr_list]
+                        rays_local = [marker_to_camera_ray(marker, tan_x, tan_y, cam_ref.data) for marker in marker_curr_list]
                         weights = None
                         if props.clip_center_weight:
                             aspect = tan_x / tan_y if tan_y > 1e-6 else 1.0
@@ -1120,8 +1120,8 @@ class PCamPointSolver:
                             if any(marker is None for marker in marker_ref_list + marker_curr_list):
                                 skip_counts["missing_marker"] += 1
                                 continue
-                            ray_ref_list = [marker_to_camera_ray(marker, tan_x, tan_y) for marker in marker_ref_list]
-                            ray_curr_list = [marker_to_camera_ray(marker, tan_x, tan_y) for marker in marker_curr_list]
+                            ray_ref_list = [marker_to_camera_ray(marker, tan_x, tan_y, cam_ref.data) for marker in marker_ref_list]
+                            ray_curr_list = [marker_to_camera_ray(marker, tan_x, tan_y, cam_ref.data) for marker in marker_curr_list]
                             delta_quat = solve_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, props.clip_lock_roll)
                         else:
                             delta_quat = rot_quat

@@ -103,12 +103,7 @@ class PCamAnimationIO:
         if slots is None:
             return None
         try:
-            if getattr(slots, "active", None) is not None:
-                return slots.active
-        except Exception:
-            pass
-        try:
-            return slots[0] if len(slots) else None
+            return slots[0] if len(slots) == 1 else None
         except Exception:
             return None
 
@@ -118,39 +113,16 @@ class PCamAnimationIO:
         if action is None:
             return []
 
-        bags = []
+        legacy_fcurves = getattr(action, "fcurves", None)
+        if legacy_fcurves is not None:
+            return [action]
+
         get_channelbag = getattr(anim_utils, "action_get_channelbag_for_slot", None)
-        ensure_channelbag = getattr(anim_utils, "action_ensure_channelbag_for_slot", None)
-        slots = getattr(action, "slots", None)
-        if slots is not None:
-            try:
-                for slot in slots:
-                    channelbag = None
-                    try:
-                        if get_channelbag is not None:
-                            channelbag = get_channelbag(action, slot)
-                        elif ensure_channelbag is not None:
-                            channelbag = ensure_channelbag(action, slot)
-                    except Exception:
-                        channelbag = None
-                    if channelbag is not None and getattr(channelbag, "fcurves", None) is not None:
-                        bags.append(channelbag)
-            except Exception:
-                pass
-
-        if bags:
-            return bags
-
         slot = self._get_action_slot(id_data)
-        if slot is None:
+        if slot is None or get_channelbag is None:
             return []
         try:
-            if get_channelbag is not None:
-                channelbag = get_channelbag(action, slot)
-            elif ensure_channelbag is not None:
-                channelbag = ensure_channelbag(action, slot)
-            else:
-                channelbag = None
+            channelbag = get_channelbag(action, slot)
         except Exception:
             channelbag = None
         if channelbag is None or getattr(channelbag, "fcurves", None) is None:
@@ -168,9 +140,14 @@ class PCamAnimationIO:
         slot = self._get_action_slot(id_data)
         if slot is None:
             return None
+        get_channelbag = getattr(anim_utils, "action_get_channelbag_for_slot", None)
+        if get_channelbag is None:
+            return None
         try:
-            channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+            channelbag = get_channelbag(action, slot)
         except Exception:
+            channelbag = None
+        if channelbag is None:
             return None
         return getattr(channelbag, "fcurves", None)
 
@@ -232,9 +209,14 @@ class PCamAnimationIO:
         if action_copy is None:
             return
         anim_data = id_data.animation_data_create()
+        replaced_action = anim_data.action
+        replaced_action_users = replaced_action.users if replaced_action is not None else 0
+        replaced_action_user_limit = 2 if replaced_action is not None and getattr(replaced_action, "slots", None) is not None else 1
         # Preserve the full camera-data action when reusing an existing focal curve.
         # Lens-only restoration proved brittle in Blender when the action was recreated during solve.
         anim_data.action = action_copy
+        if replaced_action is not None and replaced_action != action_copy and replaced_action_users <= replaced_action_user_limit:
+            bpy.data.actions.remove(replaced_action)
 
     def restore_animation_curves(self, id_data, snapshots):
         if not snapshots:
@@ -242,13 +224,12 @@ class PCamAnimationIO:
         anim_data = id_data.animation_data_create()
         if not anim_data.action:
             anim_data.action = bpy.data.actions.new(name=f"{id_data.name}_Action")
-        fcurves = self._iter_action_fcurves(id_data)
-        if fcurves is None:
-            return
         for snap in snapshots:
-            for fcurve in list(fcurves):
-                if fcurve.data_path == snap["data_path"] and fcurve.array_index == snap["array_index"]:
-                    fcurves.remove(fcurve)
+            fcurves = self._iter_action_fcurves(id_data)
+            if fcurves is not None:
+                for fcurve in list(fcurves):
+                    if fcurve.data_path == snap["data_path"] and fcurve.array_index == snap["array_index"]:
+                        fcurves.remove(fcurve)
             fcurve = self._ensure_action_fcurve(id_data, snap["data_path"], index=snap["array_index"])
             if fcurve is None:
                 continue
@@ -327,8 +308,6 @@ class PCamAnimationIO:
         if not anim_data.action:
             anim_data.action = bpy.data.actions.new(name=f"{cam_data.name}_Action")
         fcurves = self._iter_action_fcurves(cam_data)
-        if fcurves is None:
-            return
 
         preserved_keys = []
         if source_snapshots:
@@ -346,9 +325,10 @@ class PCamAnimationIO:
                         "handle_left_type": key_data.get("handle_left_type", 'AUTO'),
                         "handle_right_type": key_data.get("handle_right_type", 'AUTO'),
                     })
-        for fcurve in list(fcurves):
-            if fcurve.data_path == "lens":
-                fcurves.remove(fcurve)
+        if fcurves is not None:
+            for fcurve in list(fcurves):
+                if fcurve.data_path == "lens":
+                    fcurves.remove(fcurve)
 
         lens_fcurve = self._ensure_action_fcurve(cam_data, "lens")
         if lens_fcurve is None:

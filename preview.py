@@ -56,7 +56,7 @@ def draw_trackers_callback():
         m = t.markers.find_frame(f_clip)
         if m and not getattr(m, 'mute', False):
             marker_co = get_track_display_co(t, m)
-            v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y)
+            v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y, cam_eval.data)
             v_world = cam_mat.to_3x3() @ v_cam
             hit_loc = None
             if obj_eval:

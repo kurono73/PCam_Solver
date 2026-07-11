@@ -123,7 +123,8 @@ def pcam_get_bake_block_reason(context, props):
 
 def get_camera_tan(cam_data, lens_value, scene):
     sensor_fit = cam_data.sensor_fit
-    res_x = scene.render.resolution_x * (scene.render.resolution_percentage / 100.0)
+    pixel_aspect = scene.render.pixel_aspect_x / max(scene.render.pixel_aspect_y, 1e-6)
+    res_x = scene.render.resolution_x * (scene.render.resolution_percentage / 100.0) * pixel_aspect
     res_y = scene.render.resolution_y * (scene.render.resolution_percentage / 100.0)
     if sensor_fit == 'VERTICAL' or (sensor_fit == 'AUTO' and res_x < res_y):
         sy = cam_data.sensor_height
@@ -134,8 +135,21 @@ def get_camera_tan(cam_data, lens_value, scene):
     f_safe = max(lens_value, 1e-6)
     return (sx / 2.0) / f_safe, (sy / 2.0) / f_safe
 
-def marker_to_camera_ray(marker_co, tan_x, tan_y):
-    return Vector(((2.0 * marker_co.x - 1.0) * tan_x, (2.0 * marker_co.y - 1.0) * tan_y, -1.0)).normalized()
+def marker_to_camera_ray(marker_co, tan_x, tan_y, cam_data=None):
+    shift_x = getattr(cam_data, "shift_x", 0.0) if cam_data is not None else 0.0
+    shift_y = getattr(cam_data, "shift_y", 0.0) if cam_data is not None else 0.0
+    sensor_fit = getattr(cam_data, "sensor_fit", "AUTO") if cam_data is not None else "AUTO"
+    if sensor_fit == 'VERTICAL':
+        shift_tan = tan_y
+    elif sensor_fit == 'HORIZONTAL':
+        shift_tan = tan_x
+    else:
+        shift_tan = max(tan_x, tan_y)
+    return Vector((
+        (2.0 * marker_co.x - 1.0) * tan_x + 2.0 * shift_x * shift_tan,
+        (2.0 * marker_co.y - 1.0) * tan_y + 2.0 * shift_y * shift_tan,
+        -1.0,
+    )).normalized()
 
 def get_track_display_co(track, marker):
     co = Vector(marker.co)
@@ -641,8 +655,8 @@ def solve_focal_tripod_rotation_from_markers(context, cam_data, clip, tracking_o
         marker_curr = get_track_marker_co(clip, tracking_object_idx, track_name, frame)
         if marker_ref is None or marker_curr is None:
             continue
-        ray_ref_list.append(marker_to_camera_ray(marker_ref, tan_ref_x, tan_ref_y))
-        ray_curr_list.append(marker_to_camera_ray(marker_curr, tan_frame_x, tan_frame_y))
+        ray_ref_list.append(marker_to_camera_ray(marker_ref, tan_ref_x, tan_ref_y, cam_data))
+        ray_curr_list.append(marker_to_camera_ray(marker_curr, tan_frame_x, tan_frame_y, cam_data))
 
     if len(ray_ref_list) < 1:
         return None
@@ -1123,6 +1137,10 @@ def soft_reanchor_rotation(current_rot_mat, desired_rot_mat, anchor_count, blend
 # --- Depth Reference and Fixed-Point Solve Helpers ---
 
 def raycast_marker_world(context, cam, depth_obj, marker_co):
+    hit = raycast_marker_world_with_normal(context, cam, depth_obj, marker_co)
+    return hit[0] if hit is not None else None
+
+def raycast_marker_world_with_normal(context, cam, depth_obj, marker_co):
     if not cam or not depth_obj:
         return None
 
@@ -1132,7 +1150,7 @@ def raycast_marker_world(context, cam, depth_obj, marker_co):
     cam_mat = cam_eval.matrix_world
     origin = cam_mat.translation
     tan_x, tan_y = get_camera_tan(cam_eval.data, cam_eval.data.lens, context.scene)
-    v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y)
+    v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y, cam_eval.data)
     v_world = cam_mat.to_3x3() @ v_cam
 
     mat_inv = obj_eval.matrix_world.inverted()
@@ -1140,7 +1158,10 @@ def raycast_marker_world(context, cam, depth_obj, marker_co):
     dir_loc = (mat_inv.to_3x3() @ v_world).normalized()
     success, loc, normal, face_index = obj_eval.ray_cast(ray_origin, dir_loc)
     if success:
-        return obj_eval.matrix_world @ loc
+        normal_world = obj_eval.matrix_world.inverted().transposed().to_3x3() @ normal
+        if normal_world.length_squared > 1e-12:
+            normal_world.normalize()
+        return obj_eval.matrix_world @ loc, normal_world
     return None
 
 def raycast_marker_world_from_matrix(context, cam_data, cam_matrix, depth_obj, marker_co, lens_value):
@@ -1151,7 +1172,7 @@ def raycast_marker_world_from_matrix(context, cam_data, cam_matrix, depth_obj, m
     obj_eval = depth_obj.evaluated_get(depsgraph)
     origin = cam_matrix.translation
     tan_x, tan_y = get_camera_tan(cam_data, lens_value, context.scene)
-    v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y)
+    v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y, cam_data)
     v_world = cam_matrix.to_3x3() @ v_cam
 
     mat_inv = obj_eval.matrix_world.inverted()
@@ -1220,6 +1241,108 @@ def refine_rotation_center_alignment(base_quat, desired_dirs, observed_rays, wei
     if correction.angle > math.radians(85.0):
         return base_quat
     return correction @ base_quat
+
+def solve_point_ray_camera_location(points_world, rays_world, fallback_loc, weights=None):
+    if not points_world or not rays_world or len(points_world) != len(rays_world):
+        return fallback_loc.copy()
+    if weights is None:
+        weights = [1.0] * len(points_world)
+
+    mat = Matrix(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+    rhs = Vector((0.0, 0.0, 0.0))
+    valid_count = 0
+    for point, ray, weight in zip(points_world, rays_world, weights):
+        if weight <= 1e-9 or ray.length_squared <= 1e-9:
+            continue
+        direction = ray.normalized()
+        projector = Matrix.Identity(3)
+        for row in range(3):
+            for col in range(3):
+                projector[row][col] -= direction[row] * direction[col]
+        mat += projector * weight
+        rhs += (projector @ point) * weight
+        valid_count += 1
+
+    if valid_count < 2:
+        return fallback_loc.copy()
+    try:
+        return mat.inverted() @ rhs
+    except Exception:
+        return fallback_loc.copy()
+
+def solve_camera_location_on_depth_plane(points_world, rays_world, fallback_loc, view_dir, depth_anchor_loc, weights=None):
+    if not points_world or not rays_world or len(points_world) != len(rays_world):
+        return fallback_loc.copy()
+    if view_dir.length_squared <= 1e-12:
+        return fallback_loc.copy()
+    axis_z = view_dir.normalized()
+    axis_x = axis_z.cross(Vector((0.0, 1.0, 0.0)))
+    if axis_x.length_squared <= 1e-12:
+        axis_x = axis_z.cross(Vector((1.0, 0.0, 0.0)))
+    if axis_x.length_squared <= 1e-12:
+        return fallback_loc.copy()
+    axis_x.normalize()
+    axis_y = axis_z.cross(axis_x).normalized()
+    if weights is None:
+        weights = [1.0] * len(points_world)
+
+    a00 = a01 = a11 = 0.0
+    b0 = b1 = 0.0
+    valid_count = 0
+    for point, ray, weight in zip(points_world, rays_world, weights):
+        if weight <= 1e-9 or ray.length_squared <= 1e-9:
+            continue
+        direction = ray.normalized()
+        projector = Matrix.Identity(3)
+        for row in range(3):
+            for col in range(3):
+                projector[row][col] -= direction[row] * direction[col]
+        px = projector @ axis_x
+        py = projector @ axis_y
+        residual = projector @ (depth_anchor_loc - point)
+        a00 += weight * px.dot(px)
+        a01 += weight * px.dot(py)
+        a11 += weight * py.dot(py)
+        b0 += -weight * px.dot(residual)
+        b1 += -weight * py.dot(residual)
+        valid_count += 1
+
+    if valid_count < 2:
+        return fallback_loc.copy()
+    det = a00 * a11 - a01 * a01
+    if abs(det) <= 1e-12:
+        return fallback_loc.copy()
+    x = (b0 * a11 - b1 * a01) / det
+    y = (a00 * b1 - a01 * b0) / det
+    return depth_anchor_loc + axis_x * x + axis_y * y
+
+def solve_point_from_rays(ray_origins, ray_directions, fallback_point, weights=None):
+    if not ray_origins or not ray_directions or len(ray_origins) != len(ray_directions):
+        return fallback_point.copy()
+    if weights is None:
+        weights = [1.0] * len(ray_origins)
+
+    mat = Matrix(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+    rhs = Vector((0.0, 0.0, 0.0))
+    valid_count = 0
+    for origin, direction, weight in zip(ray_origins, ray_directions, weights):
+        if weight <= 1e-9 or direction.length_squared <= 1e-9:
+            continue
+        ray = direction.normalized()
+        projector = Matrix.Identity(3)
+        for row in range(3):
+            for col in range(3):
+                projector[row][col] -= ray[row] * ray[col]
+        mat += projector * weight
+        rhs += (projector @ origin) * weight
+        valid_count += 1
+
+    if valid_count < 2:
+        return fallback_point.copy()
+    try:
+        return mat.inverted() @ rhs
+    except Exception:
+        return fallback_point.copy()
 
 def solve_rotation_quat_at_location(points_world, rays_local, cam_loc, fallback_quat, lock_roll=False, weights=None, prefer_center=False):
     if not points_world or not rays_local or len(points_world) != len(rays_local):
