@@ -23,7 +23,7 @@ def draw_trackers_callback():
         return
     
     frame = context.scene.frame_current
-    f_clip = frame - clip.frame_start + 1 - clip.frame_offset
+    f_clip = pcam_scene_to_clip_frame(clip, frame)
     points_hit, points_miss, lines = [], [], []
     depth_obj = props.clip_depth_object
     depsgraph = context.evaluated_depsgraph_get()
@@ -123,11 +123,9 @@ def update_custom_range_preview(self, context):
     scene.frame_preview_end = max(self.bake_start, self.bake_end)
 
 def update_existing_position_lock(self, context):
+    capabilities = pcam_get_solve_capabilities(self)
     if (
-        self.apply_to == 'CAMERA' and
-        self.mode in {'TWO_POINT', 'THREE_POINT'} and
-        self.scale_mode == 'FOCAL_LENGTH' and
-        not self.tripod_mode and
+        capabilities.existing_focal_required_with_position and
         self.clip_use_existing_position
     ):
         self.clip_use_existing_focal = True

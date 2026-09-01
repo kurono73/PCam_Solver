@@ -1,132 +1,53 @@
 ﻿# pcam_solver Clip Track solver
+from dataclasses import dataclass
+
 from .common import *
+
+
+@dataclass
+class _ClipRawPositionResult:
+    frame_sets: dict
+    dx_raw: dict
+    dy_raw: dict
+    pan_raw: dict
+    depth_raw: dict
+    zdepth_loc_raw: object
+    zdepth_roll_curve: object
+    zdepth_refined_world_points: object
+    track_world_data: dict
 
 class PCamClipTrackSolver:
     # Clip Track solvers.
     #
     # The refined path below is the current camera solve path. Object targets use
     # the fallback path in execute_clip_track().
-    # Current camera Clip Track path. It solves position/focal first, smooths those
-    # curves, then refits rotation from fixed depth-reference points.
-    def execute_clip_track_refined(self, context, target, clip, tracks, cam_ref, ref_f, frame_start, frame_end, depth, norm_curve, frame_markers, ref_lens, eff_scale_mode):
+    def _solve_clip_track_raw_position(
+        self,
+        context,
+        cam_ref,
+        clip,
+        tracks,
+        ref_f,
+        frame_start,
+        frame_end,
+        full_frames,
+        depth,
+        norm_curve,
+        frame_markers,
+        eff_scale_mode,
+        ref_markers,
+        init_t_inv,
+        init_t_loc,
+        init_t_quat,
+        depth_constraint_normal,
+        tan_ref_x,
+        tan_ref_y,
+        aspect,
+        fixed_world_points,
+        restore_frame,
+        rollback_animation,
+    ):
         props = context.scene.pcam_solve_props
-        is_obj = (props.apply_to == 'OBJECT')
-        full_frames = list(range(frame_start, frame_end + 1))
-        pos_smooth = props.clip_position_smooth
-        focal_smooth = props.clip_focal_smooth
-        pt_smooth = props.clip_pan_tilt_smooth
-        roll_smooth = props.clip_roll_smooth
-        frame_range = (frame_start, frame_end) if props.use_custom_range else None
-        keep_existing_position = props.clip_use_existing_position and not (props.tripod_mode and eff_scale_mode == 'FOCAL_LENGTH')
-        lens_owner = cam_ref
-        target_curve_snapshot = self.snapshot_animation_action(target)
-        lens_curve_snapshot = self.snapshot_animation_action(lens_owner.data) if getattr(lens_owner, "data", None) is not None else []
-        has_existing_focal_keys = self.has_camera_focal_length_keys(lens_owner)
-        has_focal_variation_in_range = self.camera_lens_varies_over_range(context, lens_owner, frame_start, frame_end) if frame_range is not None else False
-        keep_existing_focal = props.clip_use_existing_focal and eff_scale_mode == 'FOCAL_LENGTH' and has_existing_focal_keys
-        suppress_focal_bake = props.clip_use_existing_focal and eff_scale_mode == 'FOCAL_LENGTH' and not has_existing_focal_keys
-        pin_existing_focal_range = frame_range is not None and eff_scale_mode != 'FOCAL_LENGTH' and not keep_existing_focal and (has_existing_focal_keys or has_focal_variation_in_range)
-
-        restore_frame = context.scene.frame_current
-        context.scene.frame_set(ref_f)
-        ref_t_mat_before_clear = target.matrix_world.copy()
-        if not is_obj:
-            ref_t_mat_before_clear = matrix_without_scale(ref_t_mat_before_clear)
-        existing_loc_curve = None
-        existing_lens_curve = None
-        location_curve_snapshot = self.snapshot_animation_curves(target, {"location"}) if keep_existing_position else []
-        lens_action_copy = self.copy_animation_action(lens_owner.data) if keep_existing_focal and getattr(lens_owner, "data", None) else None
-
-        def rollback_animation():
-            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
-            if getattr(lens_owner, "data", None) is not None:
-                self.restore_animation_snapshot_exact(lens_owner.data, lens_curve_snapshot)
-            if lens_action_copy is not None and lens_action_copy.users == 0:
-                bpy.data.actions.remove(lens_action_copy)
-
-        if keep_existing_position:
-            existing_loc_curve = {}
-            for frame in full_frames:
-                context.scene.frame_set(frame)
-                existing_loc_curve[frame] = target.matrix_world.translation.copy()
-        if keep_existing_focal:
-            existing_lens_curve = {}
-            for frame in full_frames:
-                context.scene.frame_set(frame)
-                existing_lens_curve[frame] = float(target.data.lens)
-        context.scene.frame_set(ref_f)
-
-        if frame_range is None:
-            self.clear_animation_channels(target, {"location"} if keep_existing_position else set())
-            if not keep_existing_focal and getattr(lens_owner, "data", None):
-                self.clear_animation_channels(lens_owner.data)
-        else:
-            self.clear_keyframes_in_range(
-                target,
-                {"rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"} | (set() if keep_existing_position else {"location"}),
-                frame_start,
-                frame_end,
-            )
-            if getattr(lens_owner, "data", None) and not keep_existing_focal:
-                self.clear_keyframes_in_range(lens_owner.data, {"lens"}, frame_start, frame_end)
-        if pin_existing_focal_range and getattr(lens_owner, "data", None):
-            self.pin_lens_constant_in_range(lens_owner.data, frame_start, frame_end, ref_lens, lens_curve_snapshot)
-
-        context.scene.frame_set(ref_f)
-        init_t_mat = ref_t_mat_before_clear.copy()
-        init_t_loc = init_t_mat.translation.copy()
-        init_t_quat = self.get_target_rotation_quaternion(target)
-        init_t_rot3 = init_t_quat.to_matrix()
-        init_t_inv = init_t_mat.inverted()
-        tan_ref_x, tan_ref_y = get_camera_tan(cam_ref.data, ref_lens, context.scene)
-        aspect = tan_ref_x / max(tan_ref_y, 1e-6)
-
-        if keep_existing_focal and existing_lens_curve is not None:
-            lens_curve = existing_lens_curve.copy()
-        elif eff_scale_mode == 'FOCAL_LENGTH':
-            lens_curve = {f: ref_lens * norm_curve.get(f, 1.0) for f in full_frames}
-            if focal_smooth > 1e-4:
-                lens_curve = stabilize_scalar_curve(lens_curve, full_frames, None, max_blend=0.04 + 0.20 * focal_smooth)
-                lens_curve = smooth_scalar_curve_global(lens_curve, full_frames, strength=0.10 + 0.90 * focal_smooth, passes=1 + int(round(3 * focal_smooth)))
-        else:
-            lens_curve = {f: ref_lens for f in full_frames}
-
-        ref_markers = frame_markers.get(ref_f, {})
-        init_view_dir = init_t_quat @ Vector((0.0, 0.0, -1.0))
-        if init_view_dir.length_squared > 1e-12:
-            init_view_dir.normalize()
-        depth_constraint_normal = init_view_dir.copy()
-        if props.clip_depth_object:
-            center_hit = raycast_marker_world_with_normal(context, cam_ref, props.clip_depth_object, Vector((0.5, 0.5)))
-            if center_hit is not None and center_hit[1].length_squared > 1e-12:
-                depth_constraint_normal = center_hit[1].copy()
-                if depth_constraint_normal.dot(init_view_dir) < 0.0:
-                    depth_constraint_normal.negate()
-            fixed_world_points = {}
-            for track in tracks:
-                marker_co = ref_markers.get(track.name)
-                if marker_co is None:
-                    continue
-                hit = raycast_marker_world(context, cam_ref, props.clip_depth_object, marker_co)
-                if hit is not None:
-                    fixed_world_points[track.name] = hit
-        else:
-            fixed_world_points = {}
-            planar_depth = max(depth, 1e-4)
-            for name, marker_co in ref_markers.items():
-                point_local = Vector((
-                    (2.0 * marker_co.x - 1.0) * planar_depth * tan_ref_x,
-                    (2.0 * marker_co.y - 1.0) * planar_depth * tan_ref_y,
-                    -planar_depth,
-                ))
-                fixed_world_points[name] = init_t_loc + (init_t_rot3 @ point_local)
-
-        if eff_scale_mode == 'Z_DEPTH' and not fixed_world_points:
-            rollback_animation()
-            context.scene.frame_set(restore_frame)
-            self.report({'ERROR'}, "Z-Depth needs valid reference points or depth object.")
-            return {'CANCELLED'}
-
         frame_sets = {ref_f: set(ref_markers.keys())}
         dx_raw = {ref_f: 0.0}
         dy_raw = {ref_f: 0.0}
@@ -146,7 +67,7 @@ class PCamClipTrackSolver:
                 rollback_animation()
                 context.scene.frame_set(restore_frame)
                 self.report({'ERROR'}, "No depth track data extracted.")
-                return {'CANCELLED'}
+                return None
 
             ref_depth_samples = []
             ref_depth_weights = []
@@ -494,14 +415,43 @@ class PCamClipTrackSolver:
                 dx_raw[frame] = -(c_curr.x - c_ref.x) * (2.0 * depth * tan_ref_x)
                 dy_raw[frame] = -(c_curr.y - c_ref.y) * (2.0 * depth * tan_ref_y)
 
+        return _ClipRawPositionResult(
+            frame_sets=frame_sets,
+            dx_raw=dx_raw,
+            dy_raw=dy_raw,
+            pan_raw=pan_raw,
+            depth_raw=depth_raw,
+            zdepth_loc_raw=zdepth_loc_raw,
+            zdepth_roll_curve=zdepth_roll_curve,
+            zdepth_refined_world_points=zdepth_refined_world_points,
+            track_world_data=track_world_data,
+        )
+
+    def _build_clip_track_location_curve(
+        self,
+        context,
+        full_frames,
+        eff_scale_mode,
+        pos_smooth,
+        raw_position,
+        init_t_loc,
+        init_t_quat,
+        init_t_rot3,
+        keep_existing_position,
+        existing_loc_curve,
+    ):
+        props = context.scene.pcam_solve_props
+        frame_sets = raw_position.frame_sets
+        zdepth_loc_raw = raw_position.zdepth_loc_raw
+
         for frame in full_frames:
             frame_sets.setdefault(frame, frame_sets.get(frame - 1, frame_sets.get(frame + 1, set())))
 
         transition = {}
-        for i, frame in enumerate(full_frames):
+        for index, frame in enumerate(full_frames):
             curr_set = frame_sets.get(frame, set())
-            prev_set = frame_sets.get(full_frames[i - 1], curr_set) if i > 0 else curr_set
-            next_set = frame_sets.get(full_frames[i + 1], curr_set) if i < len(full_frames) - 1 else curr_set
+            prev_set = frame_sets.get(full_frames[index - 1], curr_set) if index > 0 else curr_set
+            next_set = frame_sets.get(full_frames[index + 1], curr_set) if index < len(full_frames) - 1 else curr_set
             union_a = len(curr_set | prev_set)
             union_b = len(curr_set | next_set)
             coh_a = len(curr_set & prev_set) / max(1, union_a)
@@ -510,22 +460,22 @@ class PCamClipTrackSolver:
         expanded = expand_transition_blends(transition, full_frames, radius=2, decay=0.7)
 
         if eff_scale_mode == 'Z_DEPTH' and props.clip_depth_object and zdepth_loc_raw is None:
-            pan_curve = stabilize_vector_curve(pan_raw, full_frames, expanded, max_blend=0.08 + 0.28 * pos_smooth)
+            pan_curve = stabilize_vector_curve(raw_position.pan_raw, full_frames, expanded, max_blend=0.08 + 0.28 * pos_smooth)
             pan_curve = bridge_vector_curve(pan_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.36 + 0.28 * pos_smooth)
-            depth_curve = stabilize_scalar_curve(depth_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
+            depth_curve = stabilize_scalar_curve(raw_position.depth_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
             depth_curve = bridge_scalar_curve(depth_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.34 + 0.26 * pos_smooth)
             pan_curve = smooth_vector_curve_global(pan_curve, full_frames, strength=0.10 + 0.90 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
             depth_curve = smooth_scalar_curve_global(depth_curve, full_frames, strength=0.08 + 0.82 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
         elif eff_scale_mode == 'Z_DEPTH' and props.clip_depth_object:
-            depth_curve = stabilize_scalar_curve(depth_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
+            depth_curve = stabilize_scalar_curve(raw_position.depth_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
             depth_curve = bridge_scalar_curve(depth_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.34 + 0.26 * pos_smooth)
             depth_curve = smooth_scalar_curve_global(depth_curve, full_frames, strength=0.08 + 0.82 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
             zdepth_loc_curve = stabilize_vector_curve(zdepth_loc_raw, full_frames, expanded, max_blend=0.08 + 0.28 * pos_smooth)
             zdepth_loc_curve = bridge_vector_curve(zdepth_loc_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.36 + 0.28 * pos_smooth)
             zdepth_loc_curve = smooth_vector_curve_global(zdepth_loc_curve, full_frames, strength=0.10 + 0.90 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
         else:
-            dx_curve = stabilize_scalar_curve(dx_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
-            dy_curve = stabilize_scalar_curve(dy_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
+            dx_curve = stabilize_scalar_curve(raw_position.dx_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
+            dy_curve = stabilize_scalar_curve(raw_position.dy_raw, full_frames, expanded, max_blend=0.06 + 0.24 * pos_smooth)
             dx_curve = bridge_scalar_curve(dx_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.34 + 0.28 * pos_smooth)
             dy_curve = bridge_scalar_curve(dy_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.34 + 0.28 * pos_smooth)
             dx_curve = smooth_scalar_curve_global(dx_curve, full_frames, strength=0.08 + 0.82 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
@@ -554,7 +504,39 @@ class PCamClipTrackSolver:
                 loc_curve = smooth_vector_curve_global(loc_curve, full_frames, strength=0.10 + 0.90 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
         if props.lock_camera_z:
             loc_curve = {frame: Vector((loc.x, loc.y, init_t_loc.z)) for frame, loc in loc_curve.items()}
+        return loc_curve, expanded
 
+    def _refine_clip_track_rotation_curve(
+        self,
+        context,
+        cam_ref,
+        frame_start,
+        frame_end,
+        full_frames,
+        ref_f,
+        frame_markers,
+        frame_sets,
+        fixed_world_points,
+        zdepth_roll_curve,
+        zdepth_refined_world_points,
+        track_world_data,
+        loc_curve,
+        lens_curve,
+        expanded,
+        init_t_loc,
+        init_t_quat,
+        tan_ref_x,
+        tan_ref_y,
+        aspect,
+        depth,
+        ref_lens,
+        eff_scale_mode,
+        keep_existing_position,
+        pt_smooth,
+        roll_smooth,
+        rotation_mode,
+    ):
+        props = context.scene.pcam_solve_props
         dynamic_fixed_world_points = {name: point.copy() for name, point in fixed_world_points.items()}
         if (
             eff_scale_mode == 'Z_DEPTH' and
@@ -602,9 +584,12 @@ class PCamClipTrackSolver:
             stable_names = select_stable_track_names(frame, frame_sets, dynamic_fixed_world_points.keys())
             if len(stable_names) < 3:
                 stable_names = set(frame_sets.get(frame, set()))
+            if eff_scale_mode == 'NONE' and len(stable_names & marker_map.keys()) < 2:
+                stable_names = set(marker_map.keys())
             points_world = []
             rays_local = []
             weights = []
+            used_names = set()
             for name in stable_names:
                 marker_co = marker_map.get(name)
                 if marker_co is None:
@@ -627,35 +612,227 @@ class PCamClipTrackSolver:
                 points_world.append(point_world)
                 rays_local.append(marker_to_camera_ray(marker_co, tan_x, tan_y, cam_ref.data))
                 weights.append(base_w * stability_w)
-            return points_world, rays_local, weights, len(stable_names), sum(weights) / max(1, len(weights))
+                used_names.add(name)
+            return points_world, rays_local, weights, used_names, sum(weights) / max(1, len(weights))
+
+        def solve_single_ray_to_world(desired_world, ray_local, fallback_quat, roll_reference=None):
+            if desired_world.length_squared <= 1e-9 or ray_local.length_squared <= 1e-9:
+                return fallback_quat.copy()
+            roll_reference = fallback_quat if roll_reference is None else roll_reference
+            desired_in_reference = roll_reference.inverted() @ desired_world.normalized()
+            reference_euler = (
+                roll_reference.to_euler(rotation_mode)
+                if rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'} else Euler()
+            )
+            return solve_single_ray_euler_y_locked(
+                roll_reference,
+                desired_in_reference,
+                ray_local,
+                reference_euler,
+                rotation_mode,
+            )
+
+        def solve_single_point_rotation(point_world, ray_local, frame, fallback_quat, roll_reference=None):
+            desired_world = point_world - loc_curve.get(frame, init_t_loc)
+            return solve_single_ray_to_world(desired_world, ray_local, fallback_quat, roll_reference)
+
+        def solve_none_tripod_adjacent(frame_ref, frame_curr, base_quat, roll_reference=None):
+            markers_ref = frame_markers.get(frame_ref, {})
+            markers_curr = frame_markers.get(frame_curr, {})
+            shared_names = sorted(set(markers_ref.keys()) & set(markers_curr.keys()))
+            if not shared_names:
+                return base_quat.copy(), set(), None
+            tan_ref_frame = get_camera_tan(cam_ref.data, lens_curve.get(frame_ref, ref_lens), context.scene)
+            tan_curr_frame = get_camera_tan(cam_ref.data, lens_curve.get(frame_curr, ref_lens), context.scene)
+            reference_rays = [
+                marker_to_camera_ray(markers_ref[name], tan_ref_frame[0], tan_ref_frame[1], cam_ref.data)
+                for name in shared_names
+            ]
+            current_rays = [
+                marker_to_camera_ray(markers_curr[name], tan_curr_frame[0], tan_curr_frame[1], cam_ref.data)
+                for name in shared_names
+            ]
+            weights = [
+                marker_center_weight(markers_curr[name], aspect) if props.clip_center_weight else 1.0
+                for name in shared_names
+            ]
+            if props.clip_lock_roll:
+                weight_sum = max(sum(weights), 1e-9)
+                center_ref = sum(
+                    (ray * weight for ray, weight in zip(reference_rays, weights)),
+                    Vector((0.0, 0.0, 0.0)),
+                ) / weight_sum
+                center_curr = sum(
+                    (ray * weight for ray, weight in zip(current_rays, weights)),
+                    Vector((0.0, 0.0, 0.0)),
+                ) / weight_sum
+                desired_world = base_quat @ center_ref
+                solved_quat = solve_single_ray_to_world(
+                    desired_world,
+                    center_curr,
+                    base_quat,
+                    init_t_quat,
+                )
+                single_name = shared_names[0] if len(shared_names) == 1 else None
+                return solved_quat, set(shared_names), single_name
+            if len(shared_names) == 1:
+                desired_world = base_quat @ reference_rays[0]
+                solved_quat = solve_single_ray_to_world(
+                    desired_world,
+                    current_rays[0],
+                    base_quat,
+                    roll_reference,
+                )
+                return solved_quat, set(shared_names), shared_names[0]
+            delta_quat = solve_weighted_kabsch_rotation(
+                reference_rays,
+                current_rays,
+                False,
+                weights,
+            )
+            solved_quat = base_quat @ delta_quat
+            if solved_quat.dot(base_quat) < 0.0:
+                solved_quat.negate()
+            return solved_quat, set(shared_names), None
 
         def solve_refit_rotation_curve():
             solved = {ref_f: init_t_quat.copy()}
+            rotation_frame_sets = {
+                ref_f: set(frame_markers.get(ref_f, {}).keys()) & set(dynamic_fixed_world_points.keys())
+            }
+            single_point_roll_reference_frames = {}
+            tripod_single_point_adjacent = {}
+            single_roll_reference_frame = None
             for frame in range(ref_f + 1, frame_end + 1):
                 prev_quat = solved.get(frame - 1, init_t_quat)
-                points_world, rays_local, weights, stable_count, avg_weight = build_rotation_inputs(frame, prev_quat)
-                if len(points_world) < 2:
-                    solved[frame] = prev_quat.copy()
+                if eff_scale_mode == 'NONE' and props.tripod_mode:
+                    markers_shared = set(frame_markers.get(frame - 1, {}).keys()) & set(frame_markers.get(frame, {}).keys())
+                    if props.clip_lock_roll:
+                        single_roll_reference_frame = ref_f
+                        roll_reference = init_t_quat
+                    elif len(markers_shared) == 1:
+                        if single_roll_reference_frame is None:
+                            single_roll_reference_frame = frame - 1
+                        roll_reference = solved.get(single_roll_reference_frame, prev_quat)
+                    else:
+                        roll_reference = None
+                    solved_quat, used_names, single_name = solve_none_tripod_adjacent(
+                        frame - 1, frame, prev_quat, roll_reference
+                    )
+                    solved[frame] = solved_quat
+                    rotation_frame_sets[frame] = used_names
+                    if single_name is not None:
+                        single_point_roll_reference_frames[frame] = single_roll_reference_frame
+                        tripod_single_point_adjacent[frame] = (frame - 1, single_name)
+                    elif len(used_names) >= 2:
+                        single_roll_reference_frame = None
                     continue
+                points_world, rays_local, weights, used_names, avg_weight = build_rotation_inputs(frame, prev_quat)
+                rotation_frame_sets[frame] = used_names
+                if len(points_world) < 2:
+                    if eff_scale_mode == 'NONE' and len(points_world) == 1:
+                        if single_roll_reference_frame is None:
+                            single_roll_reference_frame = frame - 1
+                        single_point_roll_reference_frames[frame] = single_roll_reference_frame
+                        roll_reference = solved.get(single_roll_reference_frame, prev_quat)
+                        solved[frame] = solve_single_point_rotation(
+                            points_world[0], rays_local[0], frame, prev_quat, roll_reference
+                        )
+                    else:
+                        solved[frame] = prev_quat.copy()
+                    continue
+                single_roll_reference_frame = None
                 raw_quat = solve_rotation_quat_at_location(points_world, rays_local, loc_curve.get(frame, init_t_loc), prev_quat, False, weights)
                 raw_quat = stabilize_camera_roll_step(raw_quat, prev_quat)
+                stable_count = len(used_names)
                 stability = min(1.0, max(0.28, (stable_count / 5.0) * avg_weight))
                 blend = (0.22 + 0.58 * (1.0 - expanded.get(frame, 0.0))) * stability
                 solved[frame] = prev_quat.slerp(raw_quat, min(1.0, max(0.0, blend)))
+            single_roll_reference_frame = None
             for frame in range(ref_f - 1, frame_start - 1, -1):
                 next_quat = solved.get(frame + 1, init_t_quat)
-                points_world, rays_local, weights, stable_count, avg_weight = build_rotation_inputs(frame, next_quat)
-                if len(points_world) < 2:
-                    solved[frame] = next_quat.copy()
+                if eff_scale_mode == 'NONE' and props.tripod_mode:
+                    markers_shared = set(frame_markers.get(frame + 1, {}).keys()) & set(frame_markers.get(frame, {}).keys())
+                    if props.clip_lock_roll:
+                        single_roll_reference_frame = ref_f
+                        roll_reference = init_t_quat
+                    elif len(markers_shared) == 1:
+                        if single_roll_reference_frame is None:
+                            single_roll_reference_frame = frame + 1
+                        roll_reference = solved.get(single_roll_reference_frame, next_quat)
+                    else:
+                        roll_reference = None
+                    solved_quat, used_names, single_name = solve_none_tripod_adjacent(
+                        frame + 1, frame, next_quat, roll_reference
+                    )
+                    solved[frame] = solved_quat
+                    rotation_frame_sets[frame] = used_names
+                    if single_name is not None:
+                        single_point_roll_reference_frames[frame] = single_roll_reference_frame
+                        tripod_single_point_adjacent[frame] = (frame + 1, single_name)
+                    elif len(used_names) >= 2:
+                        single_roll_reference_frame = None
                     continue
+                points_world, rays_local, weights, used_names, avg_weight = build_rotation_inputs(frame, next_quat)
+                rotation_frame_sets[frame] = used_names
+                if len(points_world) < 2:
+                    if eff_scale_mode == 'NONE' and len(points_world) == 1:
+                        if single_roll_reference_frame is None:
+                            single_roll_reference_frame = frame + 1
+                        single_point_roll_reference_frames[frame] = single_roll_reference_frame
+                        roll_reference = solved.get(single_roll_reference_frame, next_quat)
+                        solved[frame] = solve_single_point_rotation(
+                            points_world[0], rays_local[0], frame, next_quat, roll_reference
+                        )
+                    else:
+                        solved[frame] = next_quat.copy()
+                    continue
+                single_roll_reference_frame = None
                 raw_quat = solve_rotation_quat_at_location(points_world, rays_local, loc_curve.get(frame, init_t_loc), next_quat, False, weights)
                 raw_quat = stabilize_camera_roll_step(raw_quat, next_quat)
+                stable_count = len(used_names)
                 stability = min(1.0, max(0.28, (stable_count / 5.0) * avg_weight))
                 blend = (0.22 + 0.58 * (1.0 - expanded.get(frame, 0.0))) * stability
                 solved[frame] = next_quat.slerp(raw_quat, min(1.0, max(0.0, blend)))
 
-            solved = smooth_quaternion_curve(solved, full_frames, expanded, max_blend=0.34)
-            return bridge_quaternion_curve(solved, full_frames, expanded, threshold=0.24, max_bridge_blend=0.82)
+            rotation_transition = {}
+            for index, frame in enumerate(full_frames):
+                curr_set = rotation_frame_sets.get(frame, set())
+                prev_set = rotation_frame_sets.get(full_frames[index - 1], curr_set) if index > 0 else curr_set
+                next_set = rotation_frame_sets.get(full_frames[index + 1], curr_set) if index < len(full_frames) - 1 else curr_set
+                union_prev = len(curr_set | prev_set)
+                union_next = len(curr_set | next_set)
+                coherence_prev = len(curr_set & prev_set) / max(1, union_prev)
+                coherence_next = len(curr_set & next_set) / max(1, union_next)
+                rotation_transition[frame] = max(0.0, 1.0 - min(coherence_prev, coherence_next))
+            rotation_expanded = expand_transition_blends(rotation_transition, full_frames, radius=3, decay=0.72)
+
+            solved = smooth_quaternion_curve(solved, full_frames, rotation_expanded, max_blend=0.42)
+            solved = bridge_quaternion_curve(solved, full_frames, rotation_expanded, threshold=0.20, max_bridge_blend=0.88)
+
+            if eff_scale_mode == 'NONE' and props.tripod_mode and rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
+                continuous_eulers = {ref_f: solved.get(ref_f, init_t_quat).to_euler(rotation_mode)}
+                for frame in range(ref_f + 1, frame_end + 1):
+                    continuous_eulers[frame] = solved.get(frame, init_t_quat).to_euler(
+                        rotation_mode, continuous_eulers[frame - 1]
+                    )
+                for frame in range(ref_f - 1, frame_start - 1, -1):
+                    continuous_eulers[frame] = solved.get(frame, init_t_quat).to_euler(
+                        rotation_mode, continuous_eulers[frame + 1]
+                    )
+                roll_curve = {frame: euler.y for frame, euler in continuous_eulers.items()}
+                roll_curve = stabilize_scalar_curve(roll_curve, full_frames, rotation_expanded, max_blend=0.58)
+                roll_curve = bridge_scalar_curve(
+                    roll_curve, full_frames, rotation_expanded, threshold=0.20, max_bridge_blend=0.92
+                )
+                solved = {
+                    frame: Euler(
+                        (continuous_eulers[frame].x, roll_curve[frame], continuous_eulers[frame].z),
+                        rotation_mode,
+                    ).to_quaternion()
+                    for frame in full_frames
+                }
+            return solved, single_point_roll_reference_frames, tripod_single_point_adjacent
 
         def apply_rotation_smooth(rot_curve):
             if pt_smooth <= 1e-4 and roll_smooth <= 1e-4:
@@ -687,7 +864,7 @@ class PCamClipTrackSolver:
 
         use_zdepth_stable_roll = eff_scale_mode == 'Z_DEPTH' and props.clip_depth_object and not props.tripod_mode and zdepth_roll_curve is not None
 
-        rot_quats = solve_refit_rotation_curve()
+        rot_quats, single_point_roll_reference_frames, tripod_single_point_adjacent = solve_refit_rotation_curve()
         if use_zdepth_stable_roll and not keep_existing_position:
             roll_curve = zdepth_roll_curve.copy()
             roll_curve = bridge_scalar_curve(roll_curve, full_frames, expanded, threshold=0.28, max_bridge_blend=0.35)
@@ -701,6 +878,293 @@ class PCamClipTrackSolver:
                 for frame in full_frames
             }
         rot_quats = apply_rotation_smooth(rot_quats)
+        for frame, roll_reference_frame in single_point_roll_reference_frames.items():
+            roll_reference = rot_quats.get(roll_reference_frame, init_t_quat)
+            adjacent_data = tripod_single_point_adjacent.get(frame)
+            if adjacent_data is not None:
+                adjacent_frame, track_name = adjacent_data
+                marker_ref = frame_markers.get(adjacent_frame, {}).get(track_name)
+                marker_curr = frame_markers.get(frame, {}).get(track_name)
+                if marker_ref is None or marker_curr is None:
+                    continue
+                tan_adjacent = get_camera_tan(
+                    cam_ref.data, lens_curve.get(adjacent_frame, ref_lens), context.scene
+                )
+                tan_current = get_camera_tan(cam_ref.data, lens_curve.get(frame, ref_lens), context.scene)
+                ray_ref = marker_to_camera_ray(marker_ref, tan_adjacent[0], tan_adjacent[1], cam_ref.data)
+                ray_curr = marker_to_camera_ray(marker_curr, tan_current[0], tan_current[1], cam_ref.data)
+                desired_world = rot_quats.get(adjacent_frame, roll_reference) @ ray_ref
+                rot_quats[frame] = solve_single_ray_to_world(
+                    desired_world,
+                    ray_curr,
+                    rot_quats.get(frame, roll_reference),
+                    roll_reference,
+                )
+                continue
+            points_world, rays_local, _weights, _used_names, _avg_weight = build_rotation_inputs(
+                frame, rot_quats.get(frame, roll_reference)
+            )
+            if len(points_world) == 1:
+                rot_quats[frame] = solve_single_point_rotation(
+                    points_world[0],
+                    rays_local[0],
+                    frame,
+                    rot_quats.get(frame, roll_reference),
+                    roll_reference,
+                )
+
+        if eff_scale_mode == 'NONE' and props.clip_lock_roll:
+            rot_quats = {
+                frame: preserve_camera_roll_from_reference(
+                    rot_quats.get(frame, init_t_quat),
+                    init_t_quat,
+                )
+                for frame in full_frames
+            }
+
+        return rot_quats
+
+    def _bake_clip_track_camera_curves(
+        self,
+        context,
+        target,
+        lens_owner,
+        full_frames,
+        frame_start,
+        frame_end,
+        eff_scale_mode,
+        keep_existing_position,
+        keep_existing_focal,
+        suppress_focal_bake,
+        pin_existing_focal_range,
+        loc_curve,
+        rot_quats,
+        lens_curve,
+        init_t_loc,
+        init_t_quat,
+        location_curve_snapshot,
+        lens_action_copy,
+        ref_lens,
+        lens_curve_snapshot,
+    ):
+        self._bake_clip_track_camera_curves(
+            context,
+            target,
+            lens_owner,
+            full_frames,
+            frame_start,
+            frame_end,
+            eff_scale_mode,
+            keep_existing_position,
+            keep_existing_focal,
+            suppress_focal_bake,
+            pin_existing_focal_range,
+            loc_curve,
+            rot_quats,
+            lens_curve,
+            init_t_loc,
+            init_t_quat,
+            location_curve_snapshot,
+            lens_action_copy,
+            ref_lens,
+            lens_curve_snapshot,
+        )
+
+    # Current camera Clip Track path. It solves position/focal first, smooths those
+    # curves, then refits rotation from fixed depth-reference points.
+    def execute_clip_track_refined(self, context, target, clip, tracks, cam_ref, ref_f, frame_start, frame_end, depth, norm_curve, frame_markers, ref_lens, eff_scale_mode):
+        props = context.scene.pcam_solve_props
+        is_obj = (props.apply_to == 'OBJECT')
+        full_frames = list(range(frame_start, frame_end + 1))
+        pos_smooth = props.clip_position_smooth
+        focal_smooth = props.clip_focal_smooth
+        pt_smooth = props.clip_pan_tilt_smooth
+        roll_smooth = props.clip_roll_smooth
+        frame_range = (frame_start, frame_end) if props.use_custom_range else None
+        keep_existing_position = pcam_use_existing_position(props)
+        lens_owner = cam_ref
+        target_curve_snapshot = self.snapshot_animation_action(target)
+        lens_curve_snapshot = self.snapshot_animation_action(lens_owner.data) if getattr(lens_owner, "data", None) is not None else []
+        has_existing_focal_keys = self.has_camera_focal_length_keys(lens_owner)
+        has_focal_variation_in_range = self.camera_lens_varies_over_range(context, lens_owner, frame_start, frame_end) if frame_range is not None else False
+        keep_existing_focal = props.clip_use_existing_focal and eff_scale_mode == 'FOCAL_LENGTH' and has_existing_focal_keys
+        suppress_focal_bake = props.clip_use_existing_focal and eff_scale_mode == 'FOCAL_LENGTH' and not has_existing_focal_keys
+        pin_existing_focal_range = frame_range is not None and eff_scale_mode != 'FOCAL_LENGTH' and not keep_existing_focal and (has_existing_focal_keys or has_focal_variation_in_range)
+
+        restore_frame = context.scene.frame_current
+        context.scene.frame_set(ref_f)
+        ref_t_mat_before_clear = target.matrix_world.copy()
+        if not is_obj:
+            ref_t_mat_before_clear = matrix_without_scale(ref_t_mat_before_clear)
+        existing_loc_curve = None
+        existing_lens_curve = None
+        location_curve_snapshot = self.snapshot_animation_curves(target, {"location"}) if keep_existing_position else []
+        lens_action_copy = self.copy_animation_action(lens_owner.data) if keep_existing_focal and getattr(lens_owner, "data", None) else None
+
+        def rollback_animation():
+            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
+            if getattr(lens_owner, "data", None) is not None:
+                self.restore_animation_snapshot_exact(lens_owner.data, lens_curve_snapshot)
+            if lens_action_copy is not None and lens_action_copy.users == 0:
+                bpy.data.actions.remove(lens_action_copy)
+
+        if keep_existing_position:
+            existing_loc_curve = {}
+            for frame in full_frames:
+                context.scene.frame_set(frame)
+                existing_loc_curve[frame] = target.matrix_world.translation.copy()
+        if keep_existing_focal:
+            existing_lens_curve = {}
+            for frame in full_frames:
+                context.scene.frame_set(frame)
+                existing_lens_curve[frame] = float(target.data.lens)
+        context.scene.frame_set(ref_f)
+
+        if frame_range is None:
+            self.clear_animation_channels(target, {"location"} if keep_existing_position else set())
+            if not keep_existing_focal and getattr(lens_owner, "data", None):
+                self.clear_animation_channels(lens_owner.data)
+        else:
+            self.clear_keyframes_in_range(
+                target,
+                {"rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"} | (set() if keep_existing_position else {"location"}),
+                frame_start,
+                frame_end,
+            )
+            if getattr(lens_owner, "data", None) and not keep_existing_focal:
+                self.clear_keyframes_in_range(lens_owner.data, {"lens"}, frame_start, frame_end)
+        if pin_existing_focal_range and getattr(lens_owner, "data", None):
+            self.pin_lens_constant_in_range(lens_owner.data, frame_start, frame_end, ref_lens, lens_curve_snapshot)
+
+        context.scene.frame_set(ref_f)
+        init_t_mat = ref_t_mat_before_clear.copy()
+        init_t_loc = init_t_mat.translation.copy()
+        init_t_quat = self.get_target_rotation_quaternion(target)
+        init_t_rot3 = init_t_quat.to_matrix()
+        init_t_inv = init_t_mat.inverted()
+        tan_ref_x, tan_ref_y = get_camera_tan(cam_ref.data, ref_lens, context.scene)
+        aspect = tan_ref_x / max(tan_ref_y, 1e-6)
+
+        if keep_existing_focal and existing_lens_curve is not None:
+            lens_curve = existing_lens_curve.copy()
+        elif eff_scale_mode == 'FOCAL_LENGTH':
+            lens_curve = {f: ref_lens * norm_curve.get(f, 1.0) for f in full_frames}
+            if focal_smooth > 1e-4:
+                lens_curve = stabilize_scalar_curve(lens_curve, full_frames, None, max_blend=0.04 + 0.20 * focal_smooth)
+                lens_curve = smooth_scalar_curve_global(lens_curve, full_frames, strength=0.10 + 0.90 * focal_smooth, passes=1 + int(round(3 * focal_smooth)))
+        else:
+            lens_curve = {f: ref_lens for f in full_frames}
+
+        ref_markers = frame_markers.get(ref_f, {})
+        init_view_dir = init_t_quat @ Vector((0.0, 0.0, -1.0))
+        if init_view_dir.length_squared > 1e-12:
+            init_view_dir.normalize()
+        depth_constraint_normal = init_view_dir.copy()
+        if props.clip_depth_object:
+            center_hit = raycast_marker_world_with_normal(context, cam_ref, props.clip_depth_object, Vector((0.5, 0.5)))
+            if center_hit is not None and center_hit[1].length_squared > 1e-12:
+                depth_constraint_normal = center_hit[1].copy()
+                if depth_constraint_normal.dot(init_view_dir) < 0.0:
+                    depth_constraint_normal.negate()
+            fixed_world_points = {}
+            for track in tracks:
+                marker_co = ref_markers.get(track.name)
+                if marker_co is None:
+                    continue
+                hit = raycast_marker_world(context, cam_ref, props.clip_depth_object, marker_co)
+                if hit is not None:
+                    fixed_world_points[track.name] = hit
+        else:
+            fixed_world_points = {}
+            planar_depth = max(depth, 1e-4)
+            for name, marker_co in ref_markers.items():
+                point_local = Vector((
+                    (2.0 * marker_co.x - 1.0) * planar_depth * tan_ref_x,
+                    (2.0 * marker_co.y - 1.0) * planar_depth * tan_ref_y,
+                    -planar_depth,
+                ))
+                fixed_world_points[name] = init_t_loc + (init_t_rot3 @ point_local)
+
+        if eff_scale_mode == 'Z_DEPTH' and not fixed_world_points:
+            rollback_animation()
+            context.scene.frame_set(restore_frame)
+            self.report({'ERROR'}, "Z-Depth needs valid reference points or depth object.")
+            return {'CANCELLED'}
+
+        raw_position = self._solve_clip_track_raw_position(
+            context,
+            cam_ref,
+            clip,
+            tracks,
+            ref_f,
+            frame_start,
+            frame_end,
+            full_frames,
+            depth,
+            norm_curve,
+            frame_markers,
+            eff_scale_mode,
+            ref_markers,
+            init_t_inv,
+            init_t_loc,
+            init_t_quat,
+            depth_constraint_normal,
+            tan_ref_x,
+            tan_ref_y,
+            aspect,
+            fixed_world_points,
+            restore_frame,
+            rollback_animation,
+        )
+        if raw_position is None:
+            return {'CANCELLED'}
+        frame_sets = raw_position.frame_sets
+        zdepth_roll_curve = raw_position.zdepth_roll_curve
+        zdepth_refined_world_points = raw_position.zdepth_refined_world_points
+        track_world_data = raw_position.track_world_data
+
+        loc_curve, expanded = self._build_clip_track_location_curve(
+            context,
+            full_frames,
+            eff_scale_mode,
+            pos_smooth,
+            raw_position,
+            init_t_loc,
+            init_t_quat,
+            init_t_rot3,
+            keep_existing_position,
+            existing_loc_curve,
+        )
+
+        rot_quats = self._refine_clip_track_rotation_curve(
+            context,
+            cam_ref,
+            frame_start,
+            frame_end,
+            full_frames,
+            ref_f,
+            frame_markers,
+            frame_sets,
+            fixed_world_points,
+            zdepth_roll_curve,
+            zdepth_refined_world_points,
+            track_world_data,
+            loc_curve,
+            lens_curve,
+            expanded,
+            init_t_loc,
+            init_t_quat,
+            tan_ref_x,
+            tan_ref_y,
+            aspect,
+            depth,
+            ref_lens,
+            eff_scale_mode,
+            keep_existing_position,
+            pt_smooth,
+            roll_smooth,
+            target.rotation_mode,
+        )
 
         for frame in full_frames:
             context.scene.frame_set(frame)
@@ -721,7 +1185,8 @@ class PCamClipTrackSolver:
             self.pin_lens_constant_in_range(lens_owner.data, frame_start, frame_end, ref_lens, lens_curve_snapshot)
 
         context.scene.frame_set(ref_f)
-        self.report({'INFO'}, f"Applied Clip Track motion to '{target.name}'.")
+        total_frames = frame_end - frame_start + 1
+        self.report({'INFO'}, pcam_bake_result_message("Clip Track motion", target.name, total_frames, total_frames))
         return {'FINISHED'}
 
     def execute_clip_track_object_refined(self, context, target, clip, tracks, cam_ref, ref_f, frame_start, frame_end, frame_markers):
@@ -933,120 +1398,152 @@ class PCamClipTrackSolver:
 
         context.scene.frame_set(ref_f)
         total_frames = frame_end - frame_start + 1
-        suffix = f" Solved {baked_frames}/{total_frames} frames." if baked_frames < total_frames else ""
-        self.report({'INFO'}, f"Applied Clip Track object motion to '{target.name}'.{suffix}")
+        self.report({'INFO'}, pcam_bake_result_message("Clip Track object motion", target.name, baked_frames, total_frames))
         return {'FINISHED'}
 
 
     # Clip Track dispatcher and object fallback. Camera solves currently return
     # through execute_clip_track_refined() after marker scale analysis.
+    def _collect_clip_track_markers(self, clip, tracks, frame_start, frame_end):
+        frame_markers = {}
+        for frame in range(frame_start, frame_end + 1):
+            clip_frame = pcam_scene_to_clip_frame(clip, frame)
+            markers = {}
+            for track in tracks:
+                marker = track.markers.find_frame(clip_frame)
+                if marker and not getattr(marker, 'mute', False):
+                    markers[track.name] = get_track_display_co(track, marker)
+            frame_markers[frame] = markers
+        return frame_markers
+
+    def _clip_track_pair_scale_ratio(self, markers_a, markers_b, aspect):
+        shared = list(set(markers_a.keys()) & set(markers_b.keys()))
+        if len(shared) < 2:
+            return None
+        ratios = []
+        for first_name, second_name in itertools.combinations(shared, 2):
+            first_a = markers_a[first_name]
+            second_a = markers_a[second_name]
+            first_b = markers_b[first_name]
+            second_b = markers_b[second_name]
+            dist_a = math.sqrt(((first_a.x - second_a.x) * aspect) ** 2 + (first_a.y - second_a.y) ** 2)
+            dist_b = math.sqrt(((first_b.x - second_b.x) * aspect) ** 2 + (first_b.y - second_b.y) ** 2)
+            if dist_a > 1e-4:
+                ratios.append(dist_b / dist_a)
+        if not ratios:
+            return None
+        ratios.sort()
+        return ratios[len(ratios) // 2]
+
+    def _build_clip_track_scale_curve(self, frame_markers, frame_start, frame_end, ref_f, aspect):
+        step_scale_ratios = {}
+        for frame in range(frame_start + 1, frame_end + 1):
+            step_scale_ratios[frame] = self._clip_track_pair_scale_ratio(
+                frame_markers[frame - 1],
+                frame_markers[frame],
+                aspect,
+            ) or 1.0
+
+        base_curve = {ref_f: 1.0}
+        for frame in range(ref_f + 1, frame_end + 1):
+            base_curve[frame] = base_curve[frame - 1] * step_scale_ratios.get(frame, 1.0)
+        for frame in range(ref_f - 1, frame_start - 1, -1):
+            step_ratio = step_scale_ratios.get(frame + 1, 1.0)
+            base_curve[frame] = base_curve[frame + 1] / step_ratio if step_ratio > 1e-6 else base_curve[frame + 1]
+
+        ref_markers = frame_markers.get(ref_f, {})
+        absolute_scale = {ref_f: 1.0}
+        for frame in range(frame_start, frame_end + 1):
+            if frame == ref_f:
+                continue
+            ratio = self._clip_track_pair_scale_ratio(ref_markers, frame_markers[frame], aspect)
+            if ratio is not None:
+                absolute_scale[frame] = ratio
+
+        correction_keys = sorted(absolute_scale.keys())
+        correction_curve = {}
+        for frame in correction_keys:
+            base_value = base_curve.get(frame, 1.0)
+            correction_curve[frame] = absolute_scale[frame] / base_value if base_value > 1e-6 else 1.0
+
+        norm_curve = {}
+        for frame in range(frame_start, frame_end + 1):
+            base_value = base_curve.get(frame, 1.0)
+            if frame in correction_curve:
+                correction = correction_curve[frame]
+            else:
+                previous_keys = [key for key in correction_keys if key < frame]
+                next_keys = [key for key in correction_keys if key > frame]
+                if previous_keys and next_keys:
+                    first_key = previous_keys[-1]
+                    second_key = next_keys[0]
+                    blend = (frame - first_key) / max(1, second_key - first_key)
+                    first_correction = correction_curve[first_key]
+                    second_correction = correction_curve[second_key]
+                    correction = (
+                        first_correction * ((second_correction / first_correction) ** blend)
+                        if first_correction > 1e-6 and second_correction > 1e-6 else
+                        (1.0 - blend) * first_correction + blend * second_correction
+                    )
+                elif previous_keys:
+                    correction = correction_curve[previous_keys[-1]]
+                elif next_keys:
+                    correction = correction_curve[next_keys[0]]
+                else:
+                    correction = 1.0
+            norm_curve[frame] = base_value * correction
+        return norm_curve
+
     def execute_clip_track(self, context, target):
         props = context.scene.pcam_solve_props
-        clip_track_lock_roll = False
         clip = props.target_clip
-        is_obj = (props.apply_to == 'OBJECT')
+        is_obj = props.apply_to == 'OBJECT'
         cam_ref = context.scene.camera
-        
+
         try:
-            idx = int(props.tracking_object_idx)
-            tracks = clip.tracking.objects[idx].tracks
+            track_object_index = int(props.tracking_object_idx)
+            tracks = clip.tracking.objects[track_object_index].tracks
         except Exception:
             return {'CANCELLED'}
-            
         if not tracks:
             return {'CANCELLED'}
 
-        frame_start = props.bake_start if props.use_custom_range else clip.frame_start + clip.frame_offset
-        frame_end = props.bake_end if props.use_custom_range else clip.frame_start + clip.frame_duration - 1 + clip.frame_offset
+        frame_start, frame_end = pcam_get_frame_range(props)
         ref_f = pcam_get_reference_frame(context, props, frame_start, frame_end)
-        ref_lens = cam_ref.data.lens
 
         context.scene.frame_set(ref_f)
         ref_lens = cam_ref.data.lens
-
         context.scene.frame_set(frame_start)
-        
-        init_t_mat = target.matrix_world.copy()
-        init_c_mat = cam_ref.matrix_world.copy()
+
+        init_target_matrix = target.matrix_world.copy()
+        init_camera_matrix = cam_ref.matrix_world.copy()
         if not is_obj:
-            init_t_mat = matrix_without_scale(init_t_mat)
-            init_c_mat = matrix_without_scale(init_c_mat)
-        init_c_rot3 = init_c_mat.to_quaternion().to_matrix()
-        init_c_rot4 = init_c_rot3.to_4x4()
-        
-        current_lens = cam_ref.data.lens
-        current_rot_mat = init_c_rot4.copy()
-        current_loc = init_c_mat.translation.copy()
+            init_target_matrix = matrix_without_scale(init_target_matrix)
+            init_camera_matrix = matrix_without_scale(init_camera_matrix)
+
         eff_scale_mode = 'Z_DEPTH' if is_obj and props.scale_mode != 'NONE' else props.scale_mode
-        is_tripod = props.tripod_mode if not is_obj else False
-        keep_existing_position = (not is_obj) and props.clip_use_existing_position and not (is_tripod and eff_scale_mode == 'FOCAL_LENGTH')
-        keep_existing_focal = (not is_obj) and eff_scale_mode == 'FOCAL_LENGTH' and props.clip_use_existing_focal
-        use_refined_solver = not is_obj
-        lens_curve_snapshot = self.snapshot_animation_action(cam_ref.data) if (not is_obj and getattr(cam_ref, "data", None) is not None) else []
-        pin_existing_focal_range = props.use_custom_range and not is_obj and eff_scale_mode != 'FOCAL_LENGTH' and (
-            self.has_camera_focal_length_keys(cam_ref) or
-            self.camera_lens_varies_over_range(context, cam_ref, frame_start, frame_end)
-        )
-        
         if is_obj:
-            depth = max(0.1, (init_t_mat.translation - init_c_mat.translation).length)
+            depth = max(0.1, (init_target_matrix.translation - init_camera_matrix.translation).length)
         elif props.clip_depth_object:
-            origin_depth = max(0.1, (props.clip_depth_object.matrix_world.translation - init_c_mat.translation).length)
-            track_depth = self.estimate_track_group_depth(context, cam_ref, clip, tracks, ref_f, props.clip_depth_object)
-            if eff_scale_mode == 'Z_DEPTH' and track_depth is not None:
-                depth = max(origin_depth, track_depth)
-            else:
-                depth = origin_depth
+            origin_depth = max(0.1, (props.clip_depth_object.matrix_world.translation - init_camera_matrix.translation).length)
+            track_depth = self.estimate_track_group_depth(
+                context,
+                cam_ref,
+                clip,
+                tracks,
+                ref_f,
+                props.clip_depth_object,
+            )
+            depth = max(origin_depth, track_depth) if eff_scale_mode == 'Z_DEPTH' and track_depth is not None else origin_depth
         else:
             depth = 1.0
 
-        global_focus_point = init_c_mat.translation + init_c_rot3 @ Vector((0, 0, -depth))
-
-        frame_markers = {}
-        tan_ref_x, tan_ref_y = get_camera_tan(cam_ref.data, ref_lens, context.scene)
-        aspect = tan_ref_x / tan_ref_y if tan_ref_y > 1e-6 else 1.0
-        def phys_dist(p1, p2):
-            return math.sqrt(((p1.x - p2.x) * aspect)**2 + (p1.y - p2.y)**2)
-
-        for f in range(frame_start, frame_end + 1):
-            f_clip = f - clip.frame_start + 1 - clip.frame_offset
-            markers = {}
-            for t in tracks:
-                marker = t.markers.find_frame(f_clip)
-                if marker and not getattr(marker, 'mute', False):
-                    markers[t.name] = get_track_display_co(t, marker)
-            frame_markers[f] = markers
-
-        def pair_scale_ratio(markers_a, markers_b):
-            shared = list(set(markers_a.keys()) & set(markers_b.keys()))
-            if len(shared) < 2:
-                return None
-            ratios = []
-            for t1_name, t2_name in itertools.combinations(shared, 2):
-                dist_a = phys_dist(markers_a[t1_name], markers_a[t2_name])
-                dist_b = phys_dist(markers_b[t1_name], markers_b[t2_name])
-                if dist_a > 1e-4:
-                    ratios.append(dist_b / dist_a)
-            if not ratios:
-                return None
-            ratios.sort()
-            return ratios[len(ratios) // 2]
-
-        step_scale_ratios = {}
-        for f in range(frame_start + 1, frame_end + 1):
-            step_scale_ratios[f] = pair_scale_ratio(frame_markers[f - 1], frame_markers[f]) or 1.0
-
-        base_curve = {ref_f: 1.0}
-        for f in range(ref_f + 1, frame_end + 1):
-            base_curve[f] = base_curve[f - 1] * step_scale_ratios.get(f, 1.0)
-        for f in range(ref_f - 1, frame_start - 1, -1):
-            step_ratio = step_scale_ratios.get(f + 1, 1.0)
-            base_curve[f] = base_curve[f + 1] / step_ratio if step_ratio > 1e-6 else base_curve[f + 1]
-
+        frame_markers = self._collect_clip_track_markers(clip, tracks, frame_start, frame_end)
         ref_markers = frame_markers.get(ref_f, {})
         if props.use_reference_frame_lock and not ref_markers:
             self.report({'ERROR'}, "Reference Frame has no visible Clip Track markers.")
             return {'CANCELLED'}
+
         if is_obj:
             return self.execute_clip_track_object_refined(
                 context,
@@ -1059,356 +1556,28 @@ class PCamClipTrackSolver:
                 frame_end,
                 frame_markers,
             )
-        if use_refined_solver:
-            abs_scale_curve = {ref_f: 1.0}
-            for f in range(frame_start, frame_end + 1):
-                if f == ref_f:
-                    continue
-                abs_ratio = pair_scale_ratio(ref_markers, frame_markers[f])
-                if abs_ratio is not None:
-                    abs_scale_curve[f] = abs_ratio
 
-            correction_keys = sorted(abs_scale_curve.keys())
-            correction_curve = {}
-            for f in correction_keys:
-                base_value = base_curve.get(f, 1.0)
-                correction_curve[f] = abs_scale_curve[f] / base_value if base_value > 1e-6 else 1.0
-
-            norm_curve = {}
-            for f in range(frame_start, frame_end + 1):
-                base_value = base_curve.get(f, 1.0)
-                if f in correction_curve:
-                    corr = correction_curve[f]
-                else:
-                    prev_keys = [k for k in correction_keys if k < f]
-                    next_keys = [k for k in correction_keys if k > f]
-                    if prev_keys and next_keys:
-                        k0 = prev_keys[-1]
-                        k1 = next_keys[0]
-                        t = (f - k0) / max(1, (k1 - k0))
-                        c0 = correction_curve[k0]
-                        c1 = correction_curve[k1]
-                        corr = c0 * ((c1 / c0) ** t) if c0 > 1e-6 and c1 > 1e-6 else (1.0 - t) * c0 + t * c1
-                    elif prev_keys:
-                        corr = correction_curve[prev_keys[-1]]
-                    elif next_keys:
-                        corr = correction_curve[next_keys[0]]
-                    else:
-                        corr = 1.0
-                norm_curve[f] = base_value * corr
-        else:
-            norm_curve = base_curve.copy()
-        target_lens = {f: ref_lens * norm_curve[f] if eff_scale_mode == 'FOCAL_LENGTH' else ref_lens for f in norm_curve}
-        if (
-            not is_obj and
-            use_refined_solver
-        ):
-            return self.execute_clip_track_refined(
-                context, target, clip, tracks, cam_ref, ref_f, frame_start, frame_end,
-                depth, norm_curve, frame_markers, ref_lens, eff_scale_mode
-            )
-
-        target.keyframe_insert(data_path="location", frame=frame_start)
-        self.keyframe_target_rotation(target, frame_start)
-        if is_obj:
-            target.keyframe_insert(data_path="scale", frame=frame_start)
-        elif eff_scale_mode == 'FOCAL_LENGTH':
-            target.data.keyframe_insert(data_path="lens", frame=frame_start)
-
-        traj_rot = {frame_start: current_rot_mat.copy()}
-        traj_loc = {frame_start: current_loc.copy()}
-        traj_lens = {frame_start: current_lens}
-
-        self.clear_animation_safely(target, (frame_start, frame_end) if props.use_custom_range else None)
-        if pin_existing_focal_range:
-            self.pin_lens_constant_in_range(cam_ref.data, frame_start, frame_end, ref_lens, lens_curve_snapshot)
-
-        for f in range(frame_start + 1, frame_end + 1):
-            f_clip_prev = f - 1 - clip.frame_start + 1 - clip.frame_offset
-            f_clip_curr = f - clip.frame_start + 1 - clip.frame_offset
-            
-            context.scene.frame_set(f)
-            
-            valid_pairs = []
-            for t in tracks:
-                m1 = t.markers.find_frame(f_clip_prev)
-                m2 = t.markers.find_frame(f_clip_curr)
-                if m1 and m2 and not getattr(m1, 'mute', False) and not getattr(m2, 'mute', False):
-                    p1 = get_track_display_co(t, m1)
-                    p2 = get_track_display_co(t, m2)
-                    motion = (p2 - p1).length
-                    if motion < 0.2:
-                        valid_pairs.append((p1, p2))
-
-            if len(valid_pairs) < 2:
-                if is_tripod and use_refined_solver and eff_scale_mode != 'NONE':
-                    cam_ref.data.lens = target_lens.get(f, ref_lens)
-                    context.view_layer.update()
-                    tan_x2 = math.tan(cam_ref.data.angle_x / 2.0)
-                    tan_y2 = math.tan(cam_ref.data.angle_y / 2.0)
-
-                    anchor_ref_rays = []
-                    anchor_curr_rays = []
-                    anchor_weights = []
-                    markers_curr = frame_markers.get(f, {})
-                    for track_name in set(ref_markers.keys()) & set(markers_curr.keys()):
-                        p_ref = ref_markers[track_name]
-                        p_curr = markers_curr[track_name]
-                        if props.clip_center_weight:
-                            w = marker_center_weight(p_curr, aspect)
-                        else:
-                            w = 1.0
-                        anchor_ref_rays.append(marker_to_camera_ray(p_ref, tan_ref_x, tan_ref_y, cam_ref.data))
-                        anchor_curr_rays.append(marker_to_camera_ray(p_curr, tan_x2, tan_y2, cam_ref.data))
-                        anchor_weights.append(w)
-
-                    if anchor_ref_rays:
-                        if eff_scale_mode == 'FOCAL_LENGTH' and not clip_track_lock_roll:
-                            anchor_quat = solve_tripod_pan_tilt_from_rays(anchor_ref_rays, anchor_curr_rays, anchor_weights)
-                        else:
-                            anchor_quat = solve_weighted_kabsch_rotation(
-                                anchor_ref_rays,
-                                anchor_curr_rays,
-                                clip_track_lock_roll,
-                                anchor_weights,
-                            )
-                            if not clip_track_lock_roll:
-                                anchor_axis = sum((v * w for v, w in zip(anchor_ref_rays, anchor_weights)), Vector((0.0, 0.0, 0.0)))
-                                if anchor_axis.length_squared > 1e-9:
-                                    anchor_quat = enforce_roll_sign_continuity(anchor_quat, anchor_ref_rays, anchor_curr_rays, anchor_axis, anchor_weights)
-                        desired_rot_mat = init_c_rot4 @ anchor_quat.to_matrix().to_4x4()
-                        anchor_blend = 0.72
-                        current_rot_mat = soft_reanchor_rotation(current_rot_mat, desired_rot_mat, len(anchor_ref_rays), anchor_blend)
-                traj_rot[f] = current_rot_mat.copy()
-                traj_loc[f] = current_loc.copy()
-                traj_lens[f] = target_lens.get(f, current_lens)
-                continue
-
-            cam_ref.data.lens = target_lens[f-1]
-            context.view_layer.update()
-            tan_x1 = math.tan(cam_ref.data.angle_x / 2.0)
-            tan_y1 = math.tan(cam_ref.data.angle_y / 2.0)
-
-            weights = []
-            for p in valid_pairs:
-                if props.clip_center_weight:
-                    d = math.sqrt(((p[0].x - 0.5) * aspect)**2 + (p[0].y - 0.5)**2)
-                    weights.append(1.0 + 5.0 * math.exp(-10.0 * (d ** 2)))
-                else:
-                    weights.append(1.0)
-            sum_w = sum(weights)
-
-            c1_raw = sum((p[0]*w for p,w in zip(valid_pairs, weights)), Vector((0,0))) / sum_w
-            c2_raw = sum((p[1]*w for p,w in zip(valid_pairs, weights)), Vector((0,0))) / sum_w
-
-            v1_list = [Vector(((2.0 * p[0].x - 1.0) * tan_x1, (2.0 * p[0].y - 1.0) * tan_y1, -1.0)).normalized() for p in valid_pairs]
-            
-            if eff_scale_mode == 'FOCAL_LENGTH':
-                cam_ref.data.lens = target_lens[f]
-                context.view_layer.update()
-                tan_x2 = math.tan(cam_ref.data.angle_x / 2.0)
-                tan_y2 = math.tan(cam_ref.data.angle_y / 2.0)
-            else:
-                tan_x2, tan_y2 = tan_x1, tan_y1
-
-            step_ratio = norm_curve[f] / norm_curve[f-1] if norm_curve[f-1] > 1e-6 else 1.0
-            if eff_scale_mode == 'Z_DEPTH' and step_ratio > 1e-6:
-                center_uv = Vector((0.5, 0.5))
-                rot_pairs = [(p1, center_uv + (p2 - center_uv) / step_ratio) for p1, p2 in valid_pairs]
-            else:
-                rot_pairs = valid_pairs
-
-            v2_list_new = [Vector(((2.0 * p[1].x - 1.0) * tan_x2, (2.0 * p[1].y - 1.0) * tan_y2, -1.0)).normalized() for p in rot_pairs]
-
-            c1_3d = sum((v*w for v,w in zip(v1_list, weights)), Vector((0,0,0))).normalized()
-            c2_new_3d = sum((v*w for v,w in zip(v2_list_new, weights)), Vector((0,0,0))).normalized()
-
-            if is_tripod:
-                if eff_scale_mode == 'FOCAL_LENGTH' and use_refined_solver:
-                    full_delta_quat = solve_weighted_kabsch_rotation(v1_list, v2_list_new, clip_track_lock_roll, weights)
-                    if clip_track_lock_roll:
-                        q_pt = full_delta_quat
-                    else:
-                        try:
-                            q_pt, _twist_quat = full_delta_quat.to_swing_twist(c1_3d.normalized())
-                        except Exception:
-                            q_pt = solve_tripod_pan_tilt_from_rays(v1_list, v2_list_new, weights)
-                elif eff_scale_mode == 'NONE' or not use_refined_solver:
-                    q_pt = c2_new_3d.rotation_difference(c1_3d)
-                    full_delta_quat = q_pt
-                else:
-                    q_pt = solve_tripod_pan_tilt_from_rays(v1_list, v2_list_new, weights)
-                    full_delta_quat = q_pt
-                if eff_scale_mode == 'Z_DEPTH':
-                    e_pt = q_pt.to_euler('XYZ')
-                    pan_raw = e_pt.y
-                    c2_pan = Matrix.Rotation(pan_raw, 3, 'Y') @ c2_new_3d
-                    tilt_angle = wrap_pi(
-                        math.atan2(c1_3d.y, -c1_3d.z) -
-                        math.atan2(c2_pan.y, -c2_pan.z)
-                    )
-                    pan_angle = pan_raw
-                    q_pt_sens = Euler((tilt_angle, pan_angle, 0.0), 'XYZ').to_quaternion()
-                else:
-                    e_pt = q_pt.to_euler('XYZ')
-                    tilt_angle = e_pt.x
-                    pan_angle = e_pt.y
-                    q_pt_sens = q_pt
-                cur_depth = depth / norm_curve[f-1] if norm_curve[f-1] > 1e-6 else depth
-                new_depth = depth / norm_curve[f] if norm_curve[f] > 1e-6 else depth
-                dz = -(cur_depth - new_depth) if eff_scale_mode == 'Z_DEPTH' else 0.0
-                
-                delta_roll = 0.0
-                if not clip_track_lock_roll:
-                    v2_aligned = [q_pt_sens @ v for v in v2_list_new]
-                    angles, valid_weights = [], []
-                    for v1, v2_a, w in zip(v1_list, v2_aligned, weights):
-                        v1_proj = v1 - v1.project(c1_3d)
-                        v2_proj = v2_a - v2_a.project(c1_3d)
-                        if v1_proj.length_squared > 1e-6 and v2_proj.length_squared > 1e-6:
-                            cross = v2_proj.cross(v1_proj)
-                            sign = -1.0 if cross.dot(c1_3d) > 0 else 1.0
-                            angles.append(v2_proj.angle(v1_proj) * sign)
-                            valid_weights.append(w)
-                    if angles and sum(valid_weights) > 1e-6:
-                        delta_roll = sum(a*w for a,w in zip(angles, valid_weights)) / sum(valid_weights)
-                
-                roll_angle = delta_roll
-                if eff_scale_mode == 'FOCAL_LENGTH':
-                    if use_refined_solver:
-                        if not clip_track_lock_roll:
-                            full_delta_quat = replace_quaternion_twist(full_delta_quat, c1_3d, roll_angle)
-                        next_rot_mat = current_rot_mat @ full_delta_quat.to_matrix().to_4x4()
-                    else:
-                        roll_quat = Quaternion(c1_3d, roll_angle)
-                        next_rot_mat = current_rot_mat @ (roll_quat @ q_pt).to_matrix().to_4x4()
-                else:
-                    mat_x = Matrix.Rotation(tilt_angle, 4, 'X')
-                    mat_y = Matrix.Rotation(pan_angle, 4, 'Y')
-                    mat_z = Matrix.Rotation(roll_angle, 4, 'Z')
-                    next_rot_mat = current_rot_mat @ (mat_y @ mat_x @ mat_z)
-                    current_loc += current_rot_mat @ Vector((0.0, 0.0, dz))
-                    dz = 0.0
-                current_rot_mat = next_rot_mat
-
-                if use_refined_solver and eff_scale_mode != 'NONE':
-                    anchor_ref_rays = []
-                    anchor_curr_rays = []
-                    anchor_weights = []
-                    markers_curr = frame_markers.get(f, {})
-                    for track_name in set(ref_markers.keys()) & set(markers_curr.keys()):
-                        p_ref = ref_markers[track_name]
-                        p_curr = markers_curr[track_name]
-                        if props.clip_center_weight:
-                            w = marker_center_weight(p_curr, aspect)
-                        else:
-                            w = 1.0
-                        anchor_ref_rays.append(marker_to_camera_ray(p_ref, tan_ref_x, tan_ref_y, cam_ref.data))
-                        anchor_curr_rays.append(marker_to_camera_ray(p_curr, tan_x2, tan_y2, cam_ref.data))
-                        anchor_weights.append(w)
-
-                    if anchor_ref_rays:
-                        anchor_quat = solve_weighted_kabsch_rotation(
-                            anchor_ref_rays,
-                            anchor_curr_rays,
-                            clip_track_lock_roll,
-                            anchor_weights,
-                        )
-                        if not clip_track_lock_roll:
-                            anchor_axis = sum((v * w for v, w in zip(anchor_ref_rays, anchor_weights)), Vector((0.0, 0.0, 0.0)))
-                            if anchor_axis.length_squared > 1e-9:
-                                anchor_quat = enforce_roll_sign_continuity(anchor_quat, anchor_ref_rays, anchor_curr_rays, anchor_axis, anchor_weights)
-                        desired_rot_mat = init_c_rot4 @ anchor_quat.to_matrix().to_4x4()
-                        current_rot_mat = soft_reanchor_rotation(current_rot_mat, desired_rot_mat, len(anchor_ref_rays), 0.72)
-
-            else:
-                c2_unscaled = Vector((0.5, 0.5)) + (c2_raw - Vector((0.5, 0.5))) / step_ratio if step_ratio > 1e-6 else c2_raw
-                
-                cur_depth = depth / norm_curve[f-1] if norm_curve[f-1] > 1e-6 else depth
-                new_depth = depth / norm_curve[f] if norm_curve[f] > 1e-6 else depth
-                
-                eff_depth = cur_depth if eff_scale_mode == 'Z_DEPTH' else depth
-                w_3d, h_3d = 2.0 * eff_depth * tan_x1, 2.0 * eff_depth * tan_y1
-                dx, dy = -(c2_unscaled.x - c1_raw.x) * w_3d, -(c2_unscaled.y - c1_raw.y) * h_3d
-                dz = -(cur_depth - new_depth) if eff_scale_mode == 'Z_DEPTH' else 0.0
-                current_loc += current_rot_mat @ Vector((dx, dy, dz))
-
-                delta_roll = 0.0
-                if not clip_track_lock_roll:
-                    angles, valid_w = [], []
-                    for p1, p2, w in zip([vp[0] for vp in valid_pairs], [vp[1] for vp in valid_pairs], weights):
-                        v1, v2 = p1 - c1_raw, p2 - c2_raw
-                        if v1.length_squared > 1e-6 and v2.length_squared > 1e-6:
-                            a1, a2 = math.atan2(v1.y, v1.x * aspect), math.atan2(v2.y, v2.x * aspect)
-                            diff = a2 - a1
-                            while diff > math.pi:
-                                diff -= 2 * math.pi
-                            while diff < -math.pi:
-                                diff += 2 * math.pi
-                            angles.append(diff)
-                            valid_w.append(w * v1.length_squared)
-                    if angles and sum(valid_w) > 1e-9:
-                        raw_roll = sum(a * w for a, w in zip(angles, valid_w)) / sum(valid_w)
-                        delta_roll = max(min(raw_roll, math.radians(0.5)), -math.radians(0.5))
-                current_rot_mat = current_rot_mat @ Matrix.Rotation(-delta_roll, 4, 'Z')
-
-                if use_refined_solver:
-                    markers_curr = frame_markers.get(f, {})
-                    shared_names = list(set(ref_markers.keys()) & set(markers_curr.keys()))
-                    if shared_names:
-                        c_ref_anchor = weighted_marker_centroid(ref_markers, shared_names, aspect, props.clip_center_weight)
-                        c_curr_anchor = weighted_marker_centroid(markers_curr, shared_names, aspect, props.clip_center_weight)
-                        if c_ref_anchor is not None and c_curr_anchor is not None:
-                            if eff_scale_mode == 'Z_DEPTH' and norm_curve[f] > 1e-6:
-                                center_uv = Vector((0.5, 0.5))
-                                c_curr_anchor = center_uv + (c_curr_anchor - center_uv) / norm_curve[f]
-                            eff_depth_abs = new_depth if eff_scale_mode == 'Z_DEPTH' else depth
-                            dx_abs = -(c_curr_anchor.x - c_ref_anchor.x) * (2.0 * eff_depth_abs * tan_x2)
-                            dy_abs = -(c_curr_anchor.y - c_ref_anchor.y) * (2.0 * eff_depth_abs * tan_y2)
-                            dz_abs = -(depth - new_depth) if eff_scale_mode == 'Z_DEPTH' else 0.0
-                            desired_loc = init_c_mat.translation + current_rot_mat.to_3x3() @ Vector((dx_abs, dy_abs, dz_abs))
-                            loc_blend = 0.10 + 0.05 * min(len(shared_names) - 1, 3)
-                            current_loc = current_loc.lerp(desired_loc, min(0.25, loc_blend))
-
-            traj_rot[f] = current_rot_mat.copy()
-            traj_loc[f] = current_loc.copy()
-            traj_lens[f] = target_lens[f]
-
-        cam_ref.data.lens = ref_lens
-
-        m_align = init_c_rot4 @ traj_rot[ref_f].inverted()
-        loc_offset = init_c_mat.translation - m_align @ traj_loc[ref_f]
-
-        for f in range(frame_start, frame_end + 1):
-            context.scene.frame_set(f)
-            
-            f_rot = m_align @ traj_rot[f]
-            f_loc = loc_offset + m_align @ traj_loc[f]
-            f_lens = traj_lens[f]
-
-            if is_obj:
-                o_m = init_c_mat @ (f_rot.inverted() @ Matrix.Translation(-f_loc)) @ init_t_mat
-                self.set_target_rotation(target, o_m)
-                target.location = o_m.translation
-                if props.scale_mode == 'FOCAL_LENGTH':
-                    target.scale = init_t_mat.to_scale() * (f_lens / ref_lens)
-                target.keyframe_insert(data_path="scale", frame=f)
-            else:
-                if props.lock_camera_z and not is_tripod:
-                    f_loc, rot_mat = apply_z_lock(f_loc, f_rot, global_focus_point, init_c_mat.translation.z)
-                    f_rot = rot_mat
-                self.set_target_rotation(target, f_rot)
-                target.location = f_loc
-                if eff_scale_mode == 'FOCAL_LENGTH':
-                    target.data.lens = f_lens
-                    target.data.keyframe_insert(data_path="lens", frame=f)
-
-            self.keyframe_target_rotation(target, f)
-            target.keyframe_insert(data_path="location", frame=f)
-
-        context.scene.frame_set(ref_f)
-        if pin_existing_focal_range:
-            self.pin_lens_constant_in_range(cam_ref.data, frame_start, frame_end, ref_lens, lens_curve_snapshot)
-        self.report({'INFO'}, f"Applied Clip Track motion to '{target.name}'.")
-        return {'FINISHED'}
-
+        tan_ref_x, tan_ref_y = get_camera_tan(cam_ref.data, ref_lens, context.scene)
+        aspect = tan_ref_x / tan_ref_y if tan_ref_y > 1e-6 else 1.0
+        norm_curve = self._build_clip_track_scale_curve(
+            frame_markers,
+            frame_start,
+            frame_end,
+            ref_f,
+            aspect,
+        )
+        return self.execute_clip_track_refined(
+            context,
+            target,
+            clip,
+            tracks,
+            cam_ref,
+            ref_f,
+            frame_start,
+            frame_end,
+            depth,
+            norm_curve,
+            frame_markers,
+            ref_lens,
+            eff_scale_mode,
+        )

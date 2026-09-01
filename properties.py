@@ -185,7 +185,7 @@ class PCamSolveProperties(bpy.types.PropertyGroup):
 
     use_custom_range: bpy.props.BoolProperty(
         name="Custom Range",
-        description="Bake only within a manually specified frame range instead of the clip range",
+        description="Bake only within a manually specified frame range while preserving keys outside that range",
         default=False,
         update=update_custom_range_preview,
     )

@@ -13,6 +13,7 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
         layout = self.layout
         props = context.scene.pcam_solve_props
         is_cam = props.apply_to == 'CAMERA'
+        capabilities = pcam_get_solve_capabilities(props)
 
         def labeled_prop(container, data, prop_name, label, factor=0.42):
             split = container.split(factor=factor, align=True)
@@ -31,7 +32,7 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             labeled_prop(b_target, props, "target_object", "Target Object")
             labeled_prop(b_target, context.scene, "camera", "Ref Camera")
              
-        if pcam_depth_reference_required(props):
+        if capabilities.depth_reference_required:
             row = b_target.row(align=True)
             split = row.split(factor=0.42, align=True)
             split.label(text="Depth Reference")
@@ -46,12 +47,13 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
         split = row.split(factor=0.42, align=True)
         split.label(text="Movie Clip")
         split.prop(props, "target_clip", text="")
-        row.operator(OBJECT_OT_get_pcam_solve_selected_tracks.bl_idname, text="", icon='FILE_REFRESH')
+        if props.mode != 'CLIP_TRACK':
+            row.operator(OBJECT_OT_get_pcam_solve_selected_tracks.bl_idname, text="", icon='FILE_REFRESH')
         
         if props.target_clip: 
             labeled_prop(b_track, props, "tracking_object_idx", "Track Layer")
              
-            if props.mode in {'ONE_POINT', 'TWO_POINT', 'THREE_POINT'}:
+            if capabilities.uses_follow_track:
                 b_track.prop(props, "use_undistort")
                 tr = b_track.box()
                 try: track_pool = props.target_clip.tracking.objects[int(props.tracking_object_idx)]
@@ -59,14 +61,14 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
                 
                 if track_pool:
                     tr.prop_search(props, "track_1", track_pool, "tracks")
-                    if props.mode in {'TWO_POINT', 'THREE_POINT'}:
+                    if capabilities.track_count >= 2:
                         tr.prop_search(props, "track_2", track_pool, "tracks")
-                    if props.mode == 'THREE_POINT':
+                    if capabilities.track_count >= 3:
                         tr.prop_search(props, "track_3", track_pool, "tracks")
                 else:
                     tr.prop(props, "track_1")
-                    if props.mode in {'TWO_POINT', 'THREE_POINT'}: tr.prop(props, "track_2")
-                    if props.mode == 'THREE_POINT': tr.prop(props, "track_3")
+                    if capabilities.track_count >= 2: tr.prop(props, "track_2")
+                    if capabilities.track_count >= 3: tr.prop(props, "track_3")
 
         b_clip.prop(props, "track_preview", text="Preview Tracker Raycast", icon='RESTRICT_VIEW_OFF')
         if props.track_preview:
@@ -90,6 +92,8 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             if is_cam:
                 row = b_opt.row(align=True)
                 row.prop(props, "tripod_mode", text=tripod_label)
+                if props.scale_mode == 'NONE':
+                    row.prop(props, "clip_lock_roll", text="Lock Roll")
                 if not props.tripod_mode and props.scale_mode == 'Z_DEPTH':
                     row.prop(props, "lock_camera_z", text="Lock Height")
 
@@ -128,7 +132,11 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
                 b_opt.prop(props, "clip_focal_smooth", text="Focal Smooth")
             row = b_opt.row(align=True)
             row.prop(props, "clip_pan_tilt_smooth", text="Pan/Tilt Smooth")
-            row.prop(props, "clip_roll_smooth", text="Roll Smooth")
+            roll_control = row.row(align=True)
+            roll_control.enabled = not (
+                props.scale_mode == 'NONE' and props.clip_lock_roll
+            )
+            roll_control.prop(props, "clip_roll_smooth", text="Roll Smooth")
 
         b_bake = layout.box()
         b_bake.label(text="Bake", icon='ACTION')
@@ -144,29 +152,34 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             row.prop(props, "bake_end", text="Out")
             row.operator(OBJECT_OT_set_pcam_solve_bake_end.bl_idname, text="", icon='TRIA_RIGHT_BAR')
 
+        existing_position_supported = capabilities.existing_position_supported
+        existing_position_reason = capabilities.existing_position_reason
         if props.mode == 'ONE_POINT' and is_cam:
             row = b_bake.row(align=True)
+            row.enabled = existing_position_supported
             row.prop(props, "clip_use_existing_position", text="Use Existing Position")
         elif props.mode == 'CLIP_TRACK' and is_cam:
             row = b_bake.row(align=True)
             pos_row = row.row(align=True)
-            pos_row.enabled = not (props.tripod_mode and props.scale_mode == 'FOCAL_LENGTH')
+            pos_row.enabled = existing_position_supported
             pos_row.prop(props, "clip_use_existing_position", text="Use Existing Position")
-            if props.scale_mode == 'FOCAL_LENGTH':
+            if capabilities.existing_focal_supported:
                 row.prop(props, "clip_use_existing_focal", text="Use Existing Focal")
         elif props.mode in {'TWO_POINT', 'THREE_POINT'} and is_cam:
             row = b_bake.row(align=True)
             pos_row = row.row(align=True)
-            use_existing_position_enabled = not (props.tripod_mode and props.scale_mode == 'FOCAL_LENGTH')
-            pos_row.enabled = use_existing_position_enabled
+            pos_row.enabled = existing_position_supported
             pos_row.prop(props, "clip_use_existing_position", text="Use Existing Position")
-            if props.scale_mode == 'FOCAL_LENGTH':
-                if use_existing_position_enabled and props.clip_use_existing_position:
+            if capabilities.existing_focal_supported:
+                if capabilities.existing_focal_required_with_position and props.clip_use_existing_position:
                     focal_row = row.row(align=True)
                     focal_row.enabled = False
                     focal_row.label(text="Use Existing Focal", icon='CHECKBOX_HLT')
                 else:
                     row.prop(props, "clip_use_existing_focal", text="Use Existing Focal")
+
+        if is_cam and props.clip_use_existing_position and not existing_position_supported:
+            b_bake.label(text=existing_position_reason, icon='INFO')
 
         block_reason = pcam_get_bake_block_reason(context, props)
         row_bake = b_bake.row()

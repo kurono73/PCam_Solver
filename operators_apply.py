@@ -60,6 +60,18 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, PCamFo
         else:
             target.keyframe_insert(data_path="rotation_euler", frame=frame)
 
+    def select_baked_target(self, context, target):
+        for obj in context.selected_objects:
+            try:
+                obj.select_set(False)
+            except Exception:
+                pass
+        try:
+            target.select_set(True)
+            context.view_layer.objects.active = target
+        except Exception:
+            pass
+
     # Main dispatcher.
     def execute(self, context):
         props = context.scene.pcam_solve_props
@@ -82,15 +94,23 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, PCamFo
         if block_reason:
             self.report({'ERROR'}, block_reason)
             return {'CANCELLED'}
-            
+
+        existing_position_supported, existing_position_reason = pcam_existing_position_support(props)
+        if props.clip_use_existing_position and not existing_position_supported:
+            self.report({'WARNING'}, f"Use Existing Position ignored: {existing_position_reason}")
+             
         if props.mode == 'CLIP_TRACK':
-            return self.execute_clip_track(context, target)
+            result = self.execute_clip_track(context, target)
         elif props.mode == 'ONE_POINT':
-            return self.execute_one_point(context, target)
+            result = self.execute_one_point(context, target)
         elif props.mode == 'TWO_POINT':
-            return self.execute_two_point(context, target)
+            result = self.execute_two_point(context, target)
         elif props.mode == 'THREE_POINT':
-            return self.execute_three_point(context, target)
-        
-        return {'FINISHED'}
+            result = self.execute_three_point(context, target)
+        else:
+            result = {'FINISHED'}
+
+        if result == {'FINISHED'}:
+            self.select_baked_target(context, target)
+        return result
 

@@ -4,6 +4,9 @@ from mathutils import Vector, Euler, Matrix, Quaternion
 import math
 import itertools
 
+from .capabilities import *
+from .timeline import *
+
 # --- UI and Validation Helpers ---
 
 def get_track_objects(self, context):
@@ -15,36 +18,6 @@ def get_track_objects(self, context):
         items.append(("0", "Camera", ""))
     return items
 
-def pcam_required_track_count(props):
-    if props.mode == 'CLIP_TRACK':
-        return 0
-    if props.mode == 'THREE_POINT':
-        return 3
-    if props.mode == 'TWO_POINT':
-        return 2
-    return 1
-
-def pcam_depth_reference_required(props):
-    if props.mode == 'ONE_POINT':
-        return not props.tripod_mode
-    if props.mode in {'TWO_POINT', 'THREE_POINT'}:
-        if props.apply_to == 'OBJECT':
-            return True
-        if props.tripod_mode and props.scale_mode == 'NONE':
-            return False
-        if not props.tripod_mode and props.scale_mode == 'NONE':
-            return True
-        return props.scale_mode in {'Z_DEPTH', 'FOCAL_LENGTH'}
-    if props.mode == 'CLIP_TRACK':
-        if props.apply_to == 'OBJECT':
-            return True
-        if props.scale_mode == 'NONE' and props.tripod_mode:
-            return False
-        if props.scale_mode == 'NONE' and not props.tripod_mode:
-            return True
-        return props.scale_mode in {'Z_DEPTH', 'FOCAL_LENGTH'}
-    return False
-
 def pcam_get_track_pool(props):
     if not props.target_clip:
         return None
@@ -53,30 +26,8 @@ def pcam_get_track_pool(props):
     except Exception:
         return None
 
-def pcam_get_frame_range(props):
-    clip = props.target_clip
-    if not clip:
-        return (1, 1)
-    if props.use_custom_range:
-        return (min(props.bake_start, props.bake_end), max(props.bake_start, props.bake_end))
-    return (
-        clip.frame_start + clip.frame_offset,
-        clip.frame_start + clip.frame_duration - 1 + clip.frame_offset,
-    )
-
-def pcam_get_reference_frame(context, props, frame_start=None, frame_end=None):
-    if frame_start is None or frame_end is None:
-        frame_start, frame_end = pcam_get_frame_range(props)
-    if props.use_reference_frame_lock:
-        return props.reference_frame
-    return max(frame_start, min(frame_end, context.scene.frame_current))
-
-def pcam_pick_valid_reference_frame(valid_frames, hint, require_exact=False):
-    if not valid_frames:
-        return None
-    if require_exact:
-        return hint if hint in valid_frames else None
-    return nearest_frame(valid_frames, hint)
+def pcam_bake_result_message(label, target_name, baked_frames, total_frames):
+    return f"Baked {label} to '{target_name}': {baked_frames}/{total_frames} frames."
 
 def pcam_get_bake_block_reason(context, props):
     if not props.target_clip:
@@ -628,36 +579,7 @@ def track_stability_weight(frame, frame_sets, track_name):
     fall = min(1.0, next_len / 4.0)
     return 0.18 + 0.82 * min(rise, fall)
 
-# --- Movie Clip Marker Helpers ---
-
-def get_track_marker_co(clip, tracking_object_idx, track_name, scene_frame):
-    try:
-        track_obj = clip.tracking.objects[int(tracking_object_idx)]
-        track = track_obj.tracks.get(track_name)
-    except Exception:
-        return None
-    if not track:
-        return None
-    f_clip = scene_frame - clip.frame_start + 1 - clip.frame_offset
-    marker = track.markers.find_frame(f_clip)
-    if not marker or getattr(marker, 'mute', False):
-        return None
-    return get_track_display_co(track, marker)
-
-def solve_focal_tripod_rotation_from_markers(context, cam_data, clip, tracking_object_idx, track_names, ref_frame, frame, ref_lens, frame_lens, lock_roll=False):
-    tan_ref_x, tan_ref_y = get_camera_tan(cam_data, ref_lens, context.scene)
-    tan_frame_x, tan_frame_y = get_camera_tan(cam_data, frame_lens, context.scene)
-    ray_ref_list = []
-    ray_curr_list = []
-
-    for track_name in track_names:
-        marker_ref = get_track_marker_co(clip, tracking_object_idx, track_name, ref_frame)
-        marker_curr = get_track_marker_co(clip, tracking_object_idx, track_name, frame)
-        if marker_ref is None or marker_curr is None:
-            continue
-        ray_ref_list.append(marker_to_camera_ray(marker_ref, tan_ref_x, tan_ref_y, cam_data))
-        ray_curr_list.append(marker_to_camera_ray(marker_curr, tan_frame_x, tan_frame_y, cam_data))
-
+def solve_focal_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, lock_roll=False):
     if len(ray_ref_list) < 1:
         return None
     if lock_roll or len(ray_ref_list) < 2:
@@ -689,6 +611,71 @@ def solve_focal_tripod_rotation_from_markers(context, cam_data, clip, tracking_o
 
     delta_roll = sum(a * w for a, w in zip(angles, valid_weights)) / sum(valid_weights)
     return Quaternion(c_ref, -delta_roll) @ pan_tilt_quat
+
+def rescale_follow_track_ray_for_lens(context, cam_data, ray_local, source_lens, target_lens):
+    if ray_local.length_squared <= 1e-12:
+        return None
+    source_tan_x, source_tan_y = get_camera_tan(cam_data, source_lens, context.scene)
+    target_tan_x, target_tan_y = get_camera_tan(cam_data, target_lens, context.scene)
+    scaled = Vector((
+        ray_local.x * target_tan_x / max(source_tan_x, 1e-9),
+        ray_local.y * target_tan_y / max(source_tan_y, 1e-9),
+        ray_local.z,
+    ))
+    return scaled.normalized() if scaled.length_squared > 1e-12 else None
+
+def follow_track_point_to_lens_ray(context, cam_data, point_world, ray_origin_loc, ray_origin_quat, source_lens, target_lens):
+    ray_world = point_world - ray_origin_loc
+    if ray_world.length_squared <= 1e-12:
+        return None
+    ray_local = (ray_origin_quat.inverted() @ ray_world).normalized()
+    return rescale_follow_track_ray_for_lens(context, cam_data, ray_local, source_lens, target_lens)
+
+def solve_focal_tripod_rotation_from_follow_points(
+    context,
+    cam_data,
+    ref_points,
+    curr_points,
+    ray_origin_loc,
+    ray_origin_quat,
+    source_lens,
+    ref_lens,
+    frame_lens,
+    lock_roll=False,
+):
+    ray_ref_list = []
+    ray_curr_list = []
+    for ref_point, curr_point in zip(ref_points, curr_points):
+        ray_ref = follow_track_point_to_lens_ray(
+            context, cam_data, ref_point, ray_origin_loc, ray_origin_quat, source_lens, ref_lens
+        )
+        ray_curr = follow_track_point_to_lens_ray(
+            context, cam_data, curr_point, ray_origin_loc, ray_origin_quat, source_lens, frame_lens
+        )
+        if ray_ref is None or ray_curr is None:
+            continue
+        ray_ref_list.append(ray_ref)
+        ray_curr_list.append(ray_curr)
+    return solve_focal_tripod_rotation_from_rays(ray_ref_list, ray_curr_list, lock_roll)
+
+def camera_ray_to_marker_co(ray_local, tan_x, tan_y, cam_data=None):
+    if ray_local.length_squared <= 1e-12 or abs(ray_local.z) <= 1e-12:
+        return Vector((0.5, 0.5))
+    shift_x = getattr(cam_data, "shift_x", 0.0) if cam_data is not None else 0.0
+    shift_y = getattr(cam_data, "shift_y", 0.0) if cam_data is not None else 0.0
+    sensor_fit = getattr(cam_data, "sensor_fit", "AUTO") if cam_data is not None else "AUTO"
+    if sensor_fit == 'VERTICAL':
+        shift_tan = tan_y
+    elif sensor_fit == 'HORIZONTAL':
+        shift_tan = tan_x
+    else:
+        shift_tan = max(tan_x, tan_y)
+    x_tan = ray_local.x / -ray_local.z
+    y_tan = ray_local.y / -ray_local.z
+    return Vector((
+        0.5 + (x_tan - 2.0 * shift_x * shift_tan) / max(2.0 * tan_x, 1e-9),
+        0.5 + (y_tan - 2.0 * shift_y * shift_tan) / max(2.0 * tan_y, 1e-9),
+    ))
 
 # --- Rotation Solver Helpers ---
 

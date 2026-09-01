@@ -61,7 +61,7 @@ class PCamFollowTrackMixin:
         if not cam or not depth_obj or not tracks:
             return None
 
-        f_clip = frame - clip.frame_start + 1 - clip.frame_offset
+        f_clip = pcam_scene_to_clip_frame(clip, frame)
         cam_loc = cam.matrix_world.translation
         depths = []
 
@@ -119,8 +119,7 @@ class PCamFollowTrackMixin:
             context.view_layer.objects.active = empties[0][1]
         context.view_layer.update()
 
-        f_s = props.bake_start if props.use_custom_range else clip.frame_start + clip.frame_offset
-        f_e = props.bake_end if props.use_custom_range else clip.frame_start + clip.frame_duration - 1 + clip.frame_offset
+        f_s, f_e = pcam_get_frame_range(props)
         track_data_list = [{} for _ in empties]
 
         def evaluated_empty_location(empty):
@@ -137,7 +136,7 @@ class PCamFollowTrackMixin:
                 context.view_layer.update()
                 bpy.ops.nla.bake(frame_start=f_s, frame_end=f_e, step=1, only_selected=True, visual_keying=True, clear_constraints=True, use_current_action=False, bake_types={'OBJECT'})
             for f in range(f_s, f_e + 1):
-                f_clip = f - clip.frame_start + 1 - clip.frame_offset
+                f_clip = pcam_scene_to_clip_frame(clip, f)
                 context.scene.frame_set(f)
                 context.view_layer.update()
                 for index, (track_name, empty) in enumerate(empties):
