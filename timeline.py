@@ -7,11 +7,11 @@ def pcam_get_clip_scene_range(clip):
 
 
 def pcam_scene_to_clip_frame(clip, scene_frame):
-    return int(scene_frame) - int(clip.frame_start) + 1 + int(clip.frame_offset)
+    return int(scene_frame) - int(clip.frame_start) + 1
 
 
 def pcam_clip_to_scene_frame(clip, clip_frame):
-    return int(clip_frame) + int(clip.frame_start) - 1 - int(clip.frame_offset)
+    return int(clip_frame) + int(clip.frame_start) - 1
 
 
 def pcam_get_frame_range(props):

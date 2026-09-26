@@ -392,6 +392,50 @@ class PCamClipTrackSolver:
                 frame_sets[frame] = cur_set.copy()
                 dx_raw[frame] = cur_dx
                 dy_raw[frame] = cur_dy
+        elif eff_scale_mode == 'FOCAL_LENGTH' and not props.tripod_mode:
+            center_uv = Vector((0.5, 0.5))
+
+            def marker_plane_point(marker, frame):
+                point = (marker - center_uv) / max(norm_curve.get(frame, 1.0), 1e-6)
+                return Vector((point.x * aspect, point.y))
+
+            def solve_focal_translation(frames):
+                anchors = {name: marker_plane_point(marker, ref_f) for name, marker in ref_markers.items()}
+                last_angle = 0.0
+                for frame in frames:
+                    marker_map = frame_markers.get(frame, {})
+                    names = sorted(set(anchors) & set(marker_map))
+                    if not names:
+                        continue
+                    refs = [anchors[name] for name in names]
+                    current = [marker_plane_point(marker_map[name], frame) for name in names]
+                    weights = [marker_center_weight(marker_map[name], aspect) if props.clip_center_weight else 1.0 for name in names]
+                    ref_center = weighted_points_centroid(refs, weights)
+                    curr_center = weighted_points_centroid(current, weights)
+                    dot_sum = cross_sum = 0.0
+                    for a, b, weight in zip(refs, current, weights):
+                        a = a - ref_center
+                        b = b - curr_center
+                        dot_sum += weight * a.dot(b)
+                        cross_sum += weight * (a.x * b.y - a.y * b.x)
+                    if math.hypot(dot_sum, cross_sum) > 1e-12:
+                        last_angle = math.atan2(cross_sum, dot_sum)
+                    cosine, sine = math.cos(last_angle), math.sin(last_angle)
+
+                    def unrotate(point):
+                        return Vector((cosine * point.x + sine * point.y, -sine * point.x + cosine * point.y))
+
+                    delta = ref_center - unrotate(curr_center)
+                    dx_raw[frame] = delta.x * (2.0 * depth * tan_ref_y)
+                    dy_raw[frame] = delta.y * (2.0 * depth * tan_ref_y)
+                    frame_sets[frame] = set(marker_map)
+                    for name, marker in marker_map.items():
+                        if name not in anchors:
+                            # Continue from shared tracks when the original set disappears.
+                            anchors[name] = ref_center + unrotate(marker_plane_point(marker, frame) - curr_center)
+
+            solve_focal_translation(range(ref_f + 1, frame_end + 1))
+            solve_focal_translation(range(ref_f - 1, frame_start - 1, -1))
         else:
             for frame in full_frames:
                 if frame == ref_f:
@@ -502,7 +546,7 @@ class PCamClipTrackSolver:
                 loc_curve = stabilize_vector_curve(loc_curve, full_frames, expanded, max_blend=0.05 + 0.18 * pos_smooth)
                 loc_curve = bridge_vector_curve(loc_curve, full_frames, expanded, threshold=0.24, max_bridge_blend=0.22 + 0.30 * pos_smooth)
                 loc_curve = smooth_vector_curve_global(loc_curve, full_frames, strength=0.10 + 0.90 * pos_smooth, passes=1 + int(round(3 * pos_smooth)))
-        if props.lock_camera_z:
+        if props.lock_camera_z and not keep_existing_position:
             loc_curve = {frame: Vector((loc.x, loc.y, init_t_loc.z)) for frame, loc in loc_curve.items()}
         return loc_curve, expanded
 
@@ -590,21 +634,15 @@ class PCamClipTrackSolver:
             rays_local = []
             weights = []
             used_names = set()
+            pending_points = []
             for name in stable_names:
                 marker_co = marker_map.get(name)
                 if marker_co is None:
                     continue
                 point_world = dynamic_fixed_world_points.get(name)
                 if point_world is None and seed_quat is not None:
-                    point_world = seed_dynamic_fixed_point(
-                        name,
-                        frame,
-                        marker_co,
-                        loc_curve.get(frame, init_t_loc),
-                        seed_quat,
-                        lens_curve.get(frame, ref_lens),
-                    )
-                    dynamic_fixed_world_points[name] = point_world.copy()
+                    pending_points.append((name, marker_co))
+                    continue
                 if point_world is None:
                     continue
                 stability_w = track_stability_weight(frame, frame_sets, name)
@@ -613,6 +651,20 @@ class PCamClipTrackSolver:
                 rays_local.append(marker_to_camera_ray(marker_co, tan_x, tan_y, cam_ref.data))
                 weights.append(base_w * stability_w)
                 used_names.add(name)
+            if pending_points:
+                current_seed_quat = seed_quat
+                if len(points_world) >= 2:
+                    current_seed_quat = solve_rotation_quat_at_location(
+                        points_world, rays_local, loc_curve.get(frame, init_t_loc), seed_quat, False, weights,
+                    )
+                for name, marker_co in pending_points:
+                    # Establish new anchors from this frame's existing tracks,
+                    # never from a lagged previous-frame rotation.
+                    point_world = seed_dynamic_fixed_point(
+                        name, frame, marker_co, loc_curve.get(frame, init_t_loc),
+                        current_seed_quat, lens_curve.get(frame, ref_lens),
+                    )
+                    dynamic_fixed_world_points[name] = point_world.copy()
             return points_world, rays_local, weights, used_names, sum(weights) / max(1, len(weights))
 
         def solve_single_ray_to_world(desired_world, ray_local, fallback_quat, roll_reference=None):
@@ -744,10 +796,8 @@ class PCamClipTrackSolver:
                 single_roll_reference_frame = None
                 raw_quat = solve_rotation_quat_at_location(points_world, rays_local, loc_curve.get(frame, init_t_loc), prev_quat, False, weights)
                 raw_quat = stabilize_camera_roll_step(raw_quat, prev_quat)
-                stable_count = len(used_names)
-                stability = min(1.0, max(0.28, (stable_count / 5.0) * avg_weight))
-                blend = (0.22 + 0.58 * (1.0 - expanded.get(frame, 0.0))) * stability
-                solved[frame] = prev_quat.slerp(raw_quat, min(1.0, max(0.0, blend)))
+                # Reliability is represented by track weights, not a temporal lag.
+                solved[frame] = raw_quat
             single_roll_reference_frame = None
             for frame in range(ref_f - 1, frame_start - 1, -1):
                 next_quat = solved.get(frame + 1, init_t_quat)
@@ -790,10 +840,7 @@ class PCamClipTrackSolver:
                 single_roll_reference_frame = None
                 raw_quat = solve_rotation_quat_at_location(points_world, rays_local, loc_curve.get(frame, init_t_loc), next_quat, False, weights)
                 raw_quat = stabilize_camera_roll_step(raw_quat, next_quat)
-                stable_count = len(used_names)
-                stability = min(1.0, max(0.28, (stable_count / 5.0) * avg_weight))
-                blend = (0.22 + 0.58 * (1.0 - expanded.get(frame, 0.0))) * stability
-                solved[frame] = next_quat.slerp(raw_quat, min(1.0, max(0.0, blend)))
+                solved[frame] = raw_quat
 
             rotation_transition = {}
             for index, frame in enumerate(full_frames):
@@ -1021,9 +1068,13 @@ class PCamClipTrackSolver:
         context.scene.frame_set(ref_f)
 
         if frame_range is None:
-            self.clear_animation_channels(target, {"location"} if keep_existing_position else set())
+            self.clear_animation_channels(
+                target,
+                {"location"} if keep_existing_position else set(),
+                {"location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"},
+            )
             if not keep_existing_focal and getattr(lens_owner, "data", None):
-                self.clear_animation_channels(lens_owner.data)
+                self.clear_animation_channels(lens_owner.data, data_paths={"lens"})
         else:
             self.clear_keyframes_in_range(
                 target,
@@ -1177,8 +1228,6 @@ class PCamClipTrackSolver:
                 target.data.lens = lens_curve[frame]
                 target.data.keyframe_insert(data_path="lens", frame=frame)
 
-        if keep_existing_position:
-            self.restore_animation_curves(target, location_curve_snapshot)
         if keep_existing_focal and getattr(lens_owner, "data", None):
             self.restore_animation_action_copy(lens_owner.data, lens_action_copy)
         elif pin_existing_focal_range and getattr(lens_owner, "data", None):
@@ -1201,7 +1250,6 @@ class PCamClipTrackSolver:
         context.view_layer.update()
 
         init_t_mat = target.matrix_world.copy()
-        init_t_loc = init_t_mat.to_translation()
         init_t_rot = init_t_mat.to_quaternion()
         init_t_scale = target.scale.copy()
         target_curve_snapshot = self.snapshot_animation_action(target)
@@ -1211,52 +1259,29 @@ class PCamClipTrackSolver:
             self.report({'ERROR'}, "Reference Frame has no visible Clip Track markers.")
             return {'CANCELLED'}
 
-        ref_depth_mat = evaluated_matrix_world(context, depth_obj)
+        ref_depth_mat = matrix_without_scale(evaluated_matrix_world(context, depth_obj))
         ref_depth_inv = ref_depth_mat.inverted()
         ref_depth_quat_inv = ref_depth_mat.to_quaternion().inverted()
         tan_ref_x, tan_ref_y = get_camera_tan(cam_ref.data, cam_ref.data.lens, context.scene)
         aspect = tan_ref_x / tan_ref_y if tan_ref_y > 1e-6 else 1.0
 
-        def adjacent_object_roll_delta(frame_a, frame_b):
-            markers_a = frame_markers.get(frame_a, {})
-            markers_b = frame_markers.get(frame_b, {})
-            shared = list(set(markers_a.keys()) & set(markers_b.keys()))
-            if len(shared) < 2:
+        def fit_depth_plane_motion(ref_points, curr_points, weights):
+            ref_center = weighted_points_centroid(ref_points, weights)
+            curr_center = weighted_points_centroid(curr_points, weights)
+            dot_sum = cross_sum = ref_spread = curr_spread = 0.0
+            for ref_point, curr_point, weight in zip(ref_points, curr_points, weights):
+                ref = ref_point - ref_center
+                curr = curr_point - curr_center
+                dot_sum += weight * (ref.x * curr.x + ref.y * curr.y)
+                cross_sum += weight * (ref.x * curr.y - ref.y * curr.x)
+                ref_spread += weight * (ref.x * ref.x + ref.y * ref.y)
+                curr_spread += weight * (curr.x * curr.x + curr.y * curr.y)
+            covariance = math.hypot(dot_sum, cross_sum)
+            if ref_spread <= 1e-12 or curr_spread <= 1e-12 or covariance <= 1e-12:
                 return None
-            points_a = []
-            points_b = []
-            weights = []
-            for name in shared:
-                p_a = markers_a.get(name)
-                p_b = markers_b.get(name)
-                if p_a is None or p_b is None:
-                    continue
-                points_a.append(p_a)
-                points_b.append(p_b)
-                weights.append(marker_center_weight(p_b, aspect) if props.clip_center_weight else 1.0)
-            if len(points_a) < 2:
-                return None
-            return solve_planar_roll_from_points(points_a, points_b, weights, aspect)
-
-        object_roll_curve = {ref_f: 0.0}
-        current_roll = 0.0
-        for frame in range(ref_f + 1, frame_end + 1):
-            delta_roll = adjacent_object_roll_delta(frame - 1, frame)
-            if delta_roll is not None:
-                current_roll += delta_roll
-            object_roll_curve[frame] = current_roll
-        current_roll = 0.0
-        for frame in range(ref_f - 1, frame_start - 1, -1):
-            delta_roll = adjacent_object_roll_delta(frame, frame + 1)
-            if delta_roll is not None:
-                current_roll -= delta_roll
-            object_roll_curve[frame] = current_roll
-        object_roll_curve = stabilize_roll_curve(
-            object_roll_curve,
-            list(range(frame_start, frame_end + 1)),
-            despike_threshold_deg=1.2,
-            smooth_blend=0.18,
-        )
+            # Fit in the guide's metric plane, not in the moving camera's image.
+            # Summed covariance also avoids averaging angles across the +/-pi seam.
+            return math.atan2(cross_sum, dot_sum), covariance / ref_spread
 
         ref_local_points = {}
         ref_object_local_points = {}
@@ -1286,8 +1311,9 @@ class PCamClipTrackSolver:
             context.scene.frame_set(frame)
             context.view_layer.update()
             marker_map = frame_markers.get(frame, {})
-            curr_depth_mat = evaluated_matrix_world(context, depth_obj)
+            curr_depth_mat = matrix_without_scale(evaluated_matrix_world(context, depth_obj))
             curr_depth_inv = curr_depth_mat.inverted()
+            curr_cam_mat = evaluated_matrix_world(context, cam_ref)
 
             curr_world_points = []
             ref_object_locals = []
@@ -1320,21 +1346,34 @@ class PCamClipTrackSolver:
             curr_centroid_world = weighted_points_centroid(curr_world_points, weights)
             object_anchor_local = weighted_points_centroid(ref_object_locals, weights)
 
-            local_angle = object_roll_curve.get(frame, 0.0)
+            motion = fit_depth_plane_motion(ref_locals, curr_locals, weights)
+            if motion is None:
+                return None, prev_obj_quat, prev_obj_euler
+            local_angle, track_scale = motion
+            if track_scale <= 1e-6:
+                return None, prev_obj_quat, prev_obj_euler
             local_delta_quat = Quaternion(Vector((0.0, 0.0, 1.0)), local_angle)
             solved_quat = curr_depth_mat.to_quaternion() @ local_delta_quat @ ref_depth_quat_inv @ init_t_rot
-            target.location = object_location_from_local_anchor(curr_centroid_world, object_anchor_local, solved_quat, init_t_scale)
+            target.location = object_location_from_scaled_track_anchor(
+                curr_cam_mat, curr_centroid_world, object_anchor_local,
+                solved_quat, init_t_scale, track_scale,
+            )
             solved_quat = self.set_target_rotation_continuous(target, solved_quat, prev_obj_quat, prev_obj_euler)
             prev_obj_quat = solved_quat.copy()
             if prev_obj_euler is not None:
                 prev_obj_euler = target.rotation_euler.copy()
 
-            target_mat = target.matrix_world.copy()
+            target_mat_inv = Matrix.LocRotScale(target.location, solved_quat, init_t_scale).inverted()
             for name, marker_co, hit in pending_hits:
                 if name in dyn_local_points:
                     continue
-                dyn_local_points[name] = curr_depth_inv @ hit
-                dyn_object_local_points[name] = target_mat.inverted() @ hit
+                # New tracks inherit the solved object's depth, not the guide's
+                # uncorrected hit depth. Returning tracks keep their original anchor.
+                camera_location = curr_cam_mat.translation
+                corrected_hit = camera_location + (hit - camera_location) / track_scale
+                object_local = target_mat_inv @ corrected_hit
+                dyn_local_points[name] = ref_depth_inv @ (init_t_mat @ object_local)
+                dyn_object_local_points[name] = object_local
                 dyn_weights[name] = marker_center_weight(marker_co, aspect) if props.clip_center_weight else 1.0
 
             return (target.location.copy(), solved_quat.copy(), init_t_scale.copy()), prev_obj_quat, prev_obj_euler

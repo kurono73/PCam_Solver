@@ -95,7 +95,9 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
                 if props.scale_mode == 'NONE':
                     row.prop(props, "clip_lock_roll", text="Lock Roll")
                 if not props.tripod_mode and props.scale_mode == 'Z_DEPTH':
-                    row.prop(props, "lock_camera_z", text="Lock Height")
+                    height_control = row.row(align=True)
+                    height_control.enabled = not pcam_use_existing_position(props)
+                    height_control.prop(props, "lock_camera_z", text="Lock Height")
 
                 row = b_opt.row(align=True)
                 row.prop(props, "track_smoothing", text="Smooth Jitter")
@@ -119,7 +121,9 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
                 row = b_opt.row(align=True)
                 row.prop(props, "tripod_mode", text=tripod_label)
                 if not props.tripod_mode and props.scale_mode == 'Z_DEPTH':
-                    row.prop(props, "lock_camera_z", text="Lock Height")
+                    height_control = row.row(align=True)
+                    height_control.enabled = not pcam_use_existing_position(props)
+                    height_control.prop(props, "lock_camera_z", text="Lock Height")
                 row = b_opt.row(align=True)
                 row.prop(props, "track_smoothing", text="Smooth Jitter")
                 row.prop(props, "clip_lock_roll", text="Lock Roll")

@@ -4,6 +4,24 @@ from bpy_extras import anim_utils
 from .common import *
 
 class PCamAnimationIO:
+    def _snapshot_rna_values(self, value):
+        result = {}
+        for prop in value.bl_rna.properties:
+            if prop.is_readonly or prop.identifier in {'rna_type', 'type'}:
+                continue
+            if prop.type not in {'BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'}:
+                continue
+            data = getattr(value, prop.identifier)
+            result[prop.identifier] = tuple(data) if getattr(prop, 'is_array', False) else data
+        return result
+
+    def _restore_rna_values(self, value, values):
+        # Array sizes (notably Generator coefficients) depend on scalar settings.
+        for arrays in (False, True):
+            for name, data in values.items():
+                if isinstance(data, tuple) == arrays:
+                    setattr(value, name, data)
+
     # Animation I/O helpers. These wrap Blender 4.x legacy fcurves and Blender
     # 5.x action slots/channelbags behind the same local API.
     def clear_keyframes_in_range(self, id_data, data_paths, frame_start, frame_end):
@@ -26,8 +44,9 @@ class PCamAnimationIO:
                 if not fcurve.keyframe_points:
                     fcurves.remove(fcurve)
 
-    def clear_animation_channels(self, id_data, keep_paths=None):
+    def clear_animation_channels(self, id_data, keep_paths=None, data_paths=None):
         keep_paths = set(keep_paths or ())
+        data_paths = set(data_paths) if data_paths is not None else None
         channelbags = self._iter_action_channelbags(id_data)
         if not channelbags:
             return
@@ -36,7 +55,7 @@ class PCamAnimationIO:
             if fcurves is None:
                 continue
             for fcurve in list(fcurves):
-                if fcurve.data_path in keep_paths:
+                if fcurve.data_path in keep_paths or (data_paths is not None and fcurve.data_path not in data_paths):
                     continue
                 fcurves.remove(fcurve)
 
@@ -73,6 +92,17 @@ class PCamAnimationIO:
                 "array_index": fcurve.array_index,
                 "extrapolation": fcurve.extrapolation,
                 "keys": keys,
+                "settings": self._snapshot_rna_values(fcurve),
+                "group": fcurve.group.name if fcurve.group else "",
+                "modifiers": [
+                    {
+                        "type": modifier.type,
+                        "settings": self._snapshot_rna_values(modifier),
+                        "control_points": [self._snapshot_rna_values(point) for point in modifier.control_points]
+                        if modifier.type == 'ENVELOPE' else [],
+                    }
+                    for modifier in fcurve.modifiers
+                ],
             })
         return snapshots
 
@@ -87,7 +117,9 @@ class PCamAnimationIO:
         action = getattr(anim_data, "action", None)
         if not action:
             return None
-        return action.copy()
+        backup = action.copy()
+        backup.use_fake_user = False
+        return backup
 
     def _get_action_slot(self, id_data):
         anim_data = getattr(id_data, "animation_data", None)
@@ -209,14 +241,22 @@ class PCamAnimationIO:
         if action_copy is None:
             return
         anim_data = id_data.animation_data_create()
-        replaced_action = anim_data.action
-        replaced_action_users = replaced_action.users if replaced_action is not None else 0
-        replaced_action_user_limit = 2 if replaced_action is not None and getattr(replaced_action, "slots", None) is not None else 1
-        # Preserve the full camera-data action when reusing an existing focal curve.
-        # Lens-only restoration proved brittle in Blender when the action was recreated during solve.
-        anim_data.action = action_copy
-        if replaced_action is not None and replaced_action != action_copy and replaced_action_users <= replaced_action_user_limit:
-            bpy.data.actions.remove(replaced_action)
+        original_action = anim_data.action
+        original_slot = self._get_action_slot(id_data)
+        slot_identifier = original_slot.identifier if original_slot is not None else None
+        try:
+            anim_data.action = action_copy
+            if slot_identifier is not None:
+                anim_data.action_slot = next(slot for slot in action_copy.slots if slot.identifier == slot_identifier)
+            snapshots = self.snapshot_animation_action(id_data)
+        finally:
+            anim_data.action = original_action
+            if original_slot is not None:
+                anim_data.action_slot = original_slot
+        # Restore only this datablock's slot; the Object may share the same Action.
+        self.restore_animation_snapshot_exact(id_data, snapshots)
+        if action_copy.users == 0:
+            bpy.data.actions.remove(action_copy)
 
     def restore_animation_curves(self, id_data, snapshots):
         if not snapshots:
@@ -230,18 +270,19 @@ class PCamAnimationIO:
                 for fcurve in list(fcurves):
                     if fcurve.data_path == snap["data_path"] and fcurve.array_index == snap["array_index"]:
                         fcurves.remove(fcurve)
-            fcurve = self._ensure_action_fcurve(id_data, snap["data_path"], index=snap["array_index"])
+            fcurve = self._ensure_action_fcurve(id_data, snap["data_path"], index=snap["array_index"], group_name=snap.get("group", ""))
             if fcurve is None:
                 continue
             fcurve.extrapolation = snap["extrapolation"]
+            self._restore_rna_values(fcurve, snap.get("settings", {}))
             fcurve.keyframe_points.add(len(snap["keys"]))
             for key, key_data in zip(fcurve.keyframe_points, snap["keys"]):
                 key.co = key_data["co"]
-                key.handle_left = key_data["handle_left"]
-                key.handle_right = key_data["handle_right"]
                 key.interpolation = key_data["interpolation"]
                 key.handle_left_type = key_data["handle_left_type"]
                 key.handle_right_type = key_data["handle_right_type"]
+                key.handle_left = key_data["handle_left"]
+                key.handle_right = key_data["handle_right"]
                 if "easing" in key_data and hasattr(key, "easing"):
                     key.easing = key_data["easing"]
                 if "back" in key_data and hasattr(key, "back"):
@@ -251,6 +292,12 @@ class PCamAnimationIO:
                 if "period" in key_data and hasattr(key, "period"):
                     key.period = key_data["period"]
             fcurve.update()
+            for data in snap.get("modifiers", []):
+                modifier = fcurve.modifiers.new(data["type"])
+                self._restore_rna_values(modifier, data["settings"])
+                for point_data in data["control_points"]:
+                    point = modifier.control_points.add(point_data["frame"])
+                    self._restore_rna_values(point, point_data)
 
     def restore_animation_snapshot_exact(self, id_data, snapshots):
         if id_data is None:
@@ -261,45 +308,35 @@ class PCamAnimationIO:
     def clear_animation_safely(self, target, frame_range=None, keep_target_paths=None, keep_data_paths=None):
         keep_target_paths = set(keep_target_paths or ())
         keep_data_paths = set(keep_data_paths or ())
+        target_paths = {"location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"}
+        data_paths = {"lens"}
         if frame_range is None:
-            if target.animation_data and target.animation_data.action:
-                fcurves = self._iter_action_fcurves(target)
-                if fcurves is not None:
-                    for fcurve in list(fcurves):
-                        if fcurve.data_path in keep_target_paths:
-                            continue
-                        fcurves.remove(fcurve)
-            if getattr(target, "data", None) and getattr(target.data, "animation_data", None):
-                if target.data.animation_data.action:
-                    fcurves = self._iter_action_fcurves(target.data)
-                    if fcurves is not None:
-                        for fcurve in list(fcurves):
-                            if fcurve.data_path in keep_data_paths:
-                                continue
-                            fcurves.remove(fcurve)
+            self.clear_animation_channels(target, keep_target_paths, target_paths)
+            if getattr(target, "data", None) is not None:
+                self.clear_animation_channels(target.data, keep_data_paths, data_paths)
             return
 
         if not keep_target_paths and not keep_data_paths:
             frame_start, frame_end = frame_range
             self.clear_keyframes_in_range(
                 target,
-                {"location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"},
+                target_paths,
                 frame_start,
                 frame_end,
             )
             if getattr(target, "data", None):
-                self.clear_keyframes_in_range(target.data, {"lens"}, frame_start, frame_end)
+                self.clear_keyframes_in_range(target.data, data_paths, frame_start, frame_end)
             return
 
         frame_start, frame_end = frame_range
         self.clear_keyframes_in_range(
             target,
-            {"location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"} - keep_target_paths,
+            target_paths - keep_target_paths,
             frame_start,
             frame_end,
         )
         if getattr(target, "data", None):
-            self.clear_keyframes_in_range(target.data, {"lens"} - keep_data_paths, frame_start, frame_end)
+            self.clear_keyframes_in_range(target.data, data_paths - keep_data_paths, frame_start, frame_end)
 
     def pin_lens_constant_in_range(self, cam_data, frame_start, frame_end, lens_value, source_snapshots=None):
         if cam_data is None:
@@ -307,55 +344,46 @@ class PCamAnimationIO:
         anim_data = cam_data.animation_data_create()
         if not anim_data.action:
             anim_data.action = bpy.data.actions.new(name=f"{cam_data.name}_Action")
-        fcurves = self._iter_action_fcurves(cam_data)
-
-        preserved_keys = []
-        if source_snapshots:
-            for snap in source_snapshots:
-                if snap.get("data_path") != "lens":
-                    continue
-                for key_data in snap.get("keys", []):
-                    frame = float(key_data["co"][0])
-                    if frame_start <= frame <= frame_end:
-                        continue
-                    preserved_keys.append({
-                        "frame": frame,
-                        "value": float(key_data["co"][1]),
-                        "interpolation": key_data.get("interpolation", 'BEZIER'),
-                        "handle_left_type": key_data.get("handle_left_type", 'AUTO'),
-                        "handle_right_type": key_data.get("handle_right_type", 'AUTO'),
-                    })
-        if fcurves is not None:
-            for fcurve in list(fcurves):
-                if fcurve.data_path == "lens":
-                    fcurves.remove(fcurve)
-
-        lens_fcurve = self._ensure_action_fcurve(cam_data, "lens")
+        source_lens = [snap for snap in (source_snapshots or ()) if snap["data_path"] == "lens"]
+        if source_lens:
+            # Restore the original curve first so its modifiers, group and settings survive.
+            self.restore_animation_curves(cam_data, source_lens)
+        lens_fcurve = next(
+            (fc for fc in (self._iter_action_fcurves(cam_data) or ()) if fc.data_path == "lens"),
+            None,
+        )
+        if lens_fcurve is None:
+            lens_fcurve = self._ensure_action_fcurve(cam_data, "lens")
         if lens_fcurve is None:
             return
-        for key in list(lens_fcurve.keyframe_points):
-            lens_fcurve.keyframe_points.remove(key)
 
-        rebuilt_keys = preserved_keys + [
-            {
-                "frame": float(frame),
-                "value": float(lens_value),
-                "interpolation": 'CONSTANT',
-                "handle_left_type": 'VECTOR',
-                "handle_right_type": 'VECTOR',
-            }
-            for frame in range(frame_start, frame_end + 1)
-        ]
-        rebuilt_keys.sort(key=lambda item: item["frame"])
-
-        for key_data in rebuilt_keys:
-            cam_data.lens = key_data["value"]
-            lens_fcurve.keyframe_points.add(1)
-            key = lens_fcurve.keyframe_points[-1]
-            key.co = (key_data["frame"], key_data["value"])
-            key.interpolation = key_data["interpolation"]
-            key.handle_left_type = key_data["handle_left_type"]
-            key.handle_right_type = key_data["handle_right_type"]
+        for key in reversed(list(lens_fcurve.keyframe_points)):
+            if frame_start <= key.co.x <= frame_end:
+                lens_fcurve.keyframe_points.remove(key)
+        lens_fcurve.keyframe_points.add(frame_end - frame_start + 1)
+        for key, frame in zip(list(lens_fcurve.keyframe_points)[-(frame_end - frame_start + 1):], range(frame_start, frame_end + 1)):
+            key.co = (frame, lens_value)
+            key.interpolation = 'CONSTANT'
+            key.handle_left_type = 'VECTOR'
+            key.handle_right_type = 'VECTOR'
         lens_fcurve.update()
+
+        if len(lens_fcurve.modifiers):
+            # F-curve modifiers act after key interpolation; compensate their effect
+            # at each baked frame without deleting the user's modifier stack.
+            pinned_keys = {int(key.co.x): key for key in lens_fcurve.keyframe_points if frame_start <= key.co.x <= frame_end}
+            for _ in range(6):
+                max_error = 0.0
+                for frame, key in pinned_keys.items():
+                    error = lens_value - lens_fcurve.evaluate(frame)
+                    max_error = max(max_error, abs(error))
+                    if abs(error) > 1e-5:
+                        key.co = (frame, key.co.y + error)
+                if max_error <= 1e-5:
+                    break
+                lens_fcurve.update()
+            max_error = max(abs(lens_value - lens_fcurve.evaluate(frame)) for frame in pinned_keys)
+            if max_error > 1e-4:
+                self.report({'WARNING'}, "Lens F-curve modifiers prevent an exact constant lens in part of the Custom Range.")
         cam_data.lens = float(lens_value)
 

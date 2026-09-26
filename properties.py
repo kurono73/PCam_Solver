@@ -162,7 +162,7 @@ class PCamSolveProperties(bpy.types.PropertyGroup):
     )
     lock_camera_z: bpy.props.BoolProperty(
         name="Lock Height",
-        description="Keep the solved camera height fixed while still solving horizontal motion and rotation",
+        description="Keep the solved camera height fixed while still solving horizontal motion and rotation; Use Existing Position takes priority and preserves the existing height curve",
         default=False,
     )
     tripod_mode: bpy.props.BoolProperty(

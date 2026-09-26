@@ -77,7 +77,7 @@ class PCamFollowTrackMixin:
             return None
         return max(depths)
 
-    def extract_tracks_data(self, context, cam, clip, track_names, depth_obj, use_undistort, smoothing):
+    def extract_tracks_data(self, context, cam, clip, track_names, depth_obj, use_undistort, smoothing, evaluate_camera_first=False):
         track_names = [name for name in track_names if name and name != "NONE"]
         if not track_names:
             return []
@@ -131,7 +131,7 @@ class PCamFollowTrackMixin:
             return empty.evaluated_get(depsgraph).matrix_world.translation.copy()
 
         try:
-            if empties:
+            if empties and not evaluate_camera_first:
                 context.scene.frame_set(f_s)
                 context.view_layer.update()
                 bpy.ops.nla.bake(frame_start=f_s, frame_end=f_e, step=1, only_selected=True, visual_keying=True, clear_constraints=True, use_current_action=False, bake_types={'OBJECT'})
@@ -139,12 +139,18 @@ class PCamFollowTrackMixin:
                 f_clip = pcam_scene_to_clip_frame(clip, f)
                 context.scene.frame_set(f)
                 context.view_layer.update()
+                if evaluate_camera_first:
+                    # The moving camera/depth must finish evaluating before the
+                    # Follow Track constraints sample them. Retag all tracks together.
+                    for _, empty in empties:
+                        empty.update_tag(refresh={'OBJECT'})
+                    context.view_layer.update()
                 for index, (track_name, empty) in enumerate(empties):
                     track = track_object.tracks.get(track_name)
                     marker = track.markers.find_frame(f_clip) if track else None
                     if not marker or getattr(marker, 'mute', False):
                         continue
-                    if empty.animation_data and empty.animation_data.action:
+                    if evaluate_camera_first or (empty.animation_data and empty.animation_data.action):
                         track_data_list[index][f] = evaluated_empty_location(empty)
         finally:
             for _, empty in empties:

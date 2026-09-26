@@ -43,70 +43,39 @@ class PCamPointSolver:
         frame_start, frame_end = pcam_get_frame_range(props)
         frame_range = (frame_start, frame_end) if props.use_custom_range else None
 
-        target_curve_snapshot = self.snapshot_animation_action(target)
-        orig_frame = context.scene.frame_current
-        orig_scene_camera = context.scene.camera
-        orig_active = context.view_layer.objects.active
-        orig_selected = context.selected_objects[:]
-        cons = None
-
-        try:
-            context.scene.camera = cam_ref
-            self.clear_animation_safely(target, frame_range)
-            bpy.ops.object.select_all(action='DESELECT')
-            target.select_set(True)
-            context.view_layer.objects.active = target
-
-            cons = target.constraints.new(type='FOLLOW_TRACK')
-            cons.use_active_clip = False
-            cons.clip = clip
-            try:
-                cons.object = clip.tracking.objects[int(props.tracking_object_idx)].name
-            except Exception:
-                pass
-            cons.track = props.track_1
-            cons.camera = cam_ref
-            if props.clip_depth_object:
-                cons.depth_object = props.clip_depth_object
-            cons.use_3d_position = False
-            cons.use_undistorted_position = props.use_undistort
-
-            context.scene.frame_set(frame_start)
-            context.view_layer.update()
-            bpy.ops.nla.bake(
-                frame_start=frame_start,
-                frame_end=frame_end,
-                step=1,
-                only_selected=True,
-                visual_keying=True,
-                clear_constraints=True,
-                use_current_action=False,
-                bake_types={'OBJECT'},
-            )
-        finally:
-            if cons is not None:
-                try:
-                    target.constraints.remove(cons)
-                except Exception:
-                    pass
-            context.scene.camera = orig_scene_camera
-            context.scene.frame_set(orig_frame)
-            context.view_layer.update()
-            for obj in orig_selected:
-                try:
-                    obj.select_set(True)
-                except Exception:
-                    pass
-            context.view_layer.objects.active = orig_active
-
-        if not target.animation_data or not target.animation_data.action:
-            self.restore_animation_snapshot_exact(target, target_curve_snapshot)
+        ref_hint = pcam_get_reference_frame(context, props, frame_start, frame_end)
+        track_data = self.extract_tracks_data(
+            context, cam_ref, clip, [props.track_1], props.clip_depth_object,
+            props.use_undistort, props.track_smoothing, evaluate_camera_first=True,
+        )
+        positions = track_data[0] if track_data else {}
+        if not positions:
             self.report({'ERROR'}, "No frames could be baked from Track 1.")
             return {'CANCELLED'}
+        ref_f = pcam_pick_valid_reference_frame(sorted(positions), ref_hint, props.use_reference_frame_lock)
+        if ref_f is None:
+            self.report({'ERROR'}, "Reference Frame has no valid Track 1 data.")
+            return {'CANCELLED'}
+        # Follow Track is position-only. Keep the user's other channels and constraints.
+        if frame_range is not None:
+            self.clear_keyframes_in_range(target, {"location"}, *frame_range)
+        else:
+            fcurves = self._iter_action_fcurves(target)
+            if fcurves is not None:
+                for fcurve in list(fcurves):
+                    if fcurve.data_path == "location":
+                        fcurves.remove(fcurve)
+        for frame, position in sorted(positions.items()):
+            context.scene.frame_set(frame)
+            context.view_layer.update()
+            matrix = target.matrix_world.copy()
+            matrix.translation = position
+            target.matrix_world = matrix
+            target.keyframe_insert(data_path="location", frame=frame)
 
-        context.scene.frame_set(pcam_get_reference_frame(context, props, frame_start, frame_end))
+        context.scene.frame_set(ref_f)
         total_frames = frame_end - frame_start + 1
-        self.report({'INFO'}, pcam_bake_result_message("1-point motion", target.name, total_frames, total_frames))
+        self.report({'INFO'}, pcam_bake_result_message("1-point motion", target.name, len(positions), total_frames))
         return {'FINISHED'}
 
     def execute_one_point(self, context, target):
@@ -257,7 +226,10 @@ class PCamPointSolver:
                 self.report({'ERROR'}, f"Reference Frame has no valid {label} tracker data.")
             return {'CANCELLED'}
 
-        self.clear_animation_safely(target, (frame_start, frame_end) if props.use_custom_range else None)
+        self.clear_animation_safely(
+            target, (frame_start, frame_end) if props.use_custom_range else None,
+            keep_target_paths={"location"} if keep_existing_position else None,
+        )
         if pin_existing_focal_range and getattr(target, "data", None):
             self.pin_lens_constant_in_range(target.data, frame_start, frame_end, pinned_lens_value, lens_curve_snapshot)
 
@@ -376,6 +348,12 @@ class PCamPointSolver:
                     if abs(roll_delta) > 1e-9:
                         axis = init_t_rot @ Vector((0.0, 0.0, 1.0))
                         solved_quat = Quaternion(axis, -roll_delta) @ init_t_rot
+                    # Rotate the centroid ray about the optical center before
+                    # attributing its remaining motion to camera translation.
+                    desired_location = ref_center - (solved_quat @ (init_rot_inv @ (curr_center - init_t_loc)))
+                    target.location = init_t_loc + self.project_delta_parallel_to_depth(
+                        context, desired_location - init_t_loc, props.clip_depth_object,
+                    )
                 self.set_target_rotation(target, solved_quat)
             if f == ref_f:
                 if keep_existing_position:
@@ -395,9 +373,6 @@ class PCamPointSolver:
             self.report({'ERROR'}, f"No frames could be baked from {label} trackers.")
             return {'CANCELLED'}
 
-        if keep_existing_position:
-            self.restore_animation_curves(target, location_curve_snapshot)
-
         context.scene.frame_set(ref_f)
         total_frames = frame_end - frame_start + 1
         self.report({'INFO'}, pcam_bake_result_message(f"{label} None motion", target.name, baked_frames, total_frames))
@@ -416,7 +391,7 @@ class PCamPointSolver:
         clip = props.target_clip
         cam_ref = context.scene.camera
         frame_start, frame_end = pcam_get_frame_range(props)
-        frame_range = (props.bake_start, props.bake_end) if props.use_custom_range else None
+        frame_range = (frame_start, frame_end) if props.use_custom_range else None
         ref_hint = pcam_get_reference_frame(context, props, frame_start, frame_end)
 
         context.scene.frame_set(ref_hint)
@@ -496,6 +471,7 @@ class PCamPointSolver:
                 depth_obj,
                 props.use_undistort,
                 props.track_smoothing,
+                evaluate_camera_first=is_obj,
             )
             valid_frames = sorted(set.intersection(*(set(data.keys()) for data in track_data))) if track_data else []
             geometry_frames = (
@@ -547,7 +523,7 @@ class PCamPointSolver:
         self.clear_animation_safely(
             target,
             frame_range,
-            keep_target_paths=None,
+            keep_target_paths={"location"} if keep_existing_position else None,
             keep_data_paths={"lens"} if keep_existing_focal else None,
         )
         if pin_existing_focal_range and getattr(target, "data", None):
@@ -566,8 +542,6 @@ class PCamPointSolver:
             self.report({'ERROR'}, f"No frames could be baked from the selected {point_count}-point trackers. Skips: {format_skip_reasons(skip_counts)}.")
             return {'CANCELLED'}
 
-        if setup.keep_existing_position and not is_obj:
-            self.restore_animation_curves(target, setup.location_curve_snapshot)
         if setup.keep_existing_focal and not is_obj and getattr(target, "data", None):
             self.restore_animation_action_copy(target.data, setup.lens_action_copy)
         elif setup.pin_existing_focal_range and getattr(target, "data", None):
@@ -690,14 +664,12 @@ class PCamPointSolver:
                         solved_obj_quat = depth_curr_mat.to_quaternion() @ local_delta_quat @ depth_ref_quat_inv @ init_t_rot
                         depth_local_scale_ratio = vec_curr_local.length / vec_start_local.length
                 self.set_target_rotation(target, solved_obj_quat)
-                if object_anchor_local is not None:
-                    target.location = object_location_from_local_anchor(center_curr, object_anchor_local, solved_obj_quat, init_t_scale)
-                else:
-                    target.location = init_t_loc + (center_curr - center_start)
-                
                 scale_ratio = depth_local_scale_ratio if depth_local_scale_ratio is not None else (vec_curr.length / vec_start.length if vec_start.length > 0 else 1.0)
                 cam_mat_curr = evaluated_matrix_world(context, cam_ref)
-                target.location = adjust_location_depth_along_camera_axis(cam_mat_curr, target.location, scale_ratio)
+                target.location = object_location_from_scaled_track_anchor(
+                    cam_mat_curr, center_curr, object_anchor_local,
+                    solved_obj_quat, init_t_scale, scale_ratio,
+                )
                 target.scale = init_t_scale
                 
             else: # CAMERA
@@ -836,7 +808,7 @@ class PCamPointSolver:
                 keep_existing_focal or
                 props.scale_mode == 'Z_DEPTH'
             ):
-                if props.scale_mode == 'Z_DEPTH' and props.lock_camera_z:
+                if props.scale_mode == 'Z_DEPTH' and props.lock_camera_z and not keep_existing_position:
                     target.location.z = init_t_loc.z
                 fallback_quat = self.get_target_rotation_quaternion(target)
                 ray_origin_loc = init_t_loc
@@ -850,6 +822,7 @@ class PCamPointSolver:
                     fallback_quat,
                     props.clip_lock_roll,
                     prefer_center=keep_existing_position,
+                    ray_focal_ratio=setup.follow_f_len / max(target.data.lens, 1e-6) if props.scale_mode == 'FOCAL_LENGTH' else 1.0,
                 )
                 if refined_quat is None:
                     refined_quat = fallback_quat
@@ -995,6 +968,7 @@ class PCamPointSolver:
 
             if is_obj:
                 scale_ratio = scale
+                local_scale = None
                 depth_curr_mat = None
                 depth_curr_inv = None
                 points_curr_local = None
@@ -1035,11 +1009,10 @@ class PCamPointSolver:
                         solved_obj_rotation = Quaternion(view_axis, roll_delta) @ init_t_rot
 
                 if solved_obj_rotation is not None:
-                    if object_anchor_local is not None:
-                        target.location = object_location_from_local_anchor(centroid_to, object_anchor_local, solved_obj_rotation, init_t_scale)
-                    else:
-                        target.location = init_t_loc + (centroid_to - centroid_from)
-                    target.location = adjust_location_depth_along_camera_axis(cam_mat_curr, target.location, scale_ratio)
+                    target.location = object_location_from_scaled_track_anchor(
+                        cam_mat_curr, centroid_to, object_anchor_local,
+                        solved_obj_rotation, init_t_scale, scale_ratio,
+                    )
                     solved_quat = self.set_target_rotation_continuous(
                         target,
                         solved_obj_rotation,
@@ -1050,8 +1023,10 @@ class PCamPointSolver:
                     if prev_obj_euler is not None:
                         prev_obj_euler = target.rotation_euler.copy()
                 else:
-                    target.location = init_t_loc + (centroid_to - centroid_from)
-                    target.location = adjust_location_depth_along_camera_axis(cam_mat_curr, target.location, scale_ratio)
+                    target.location = object_location_from_scaled_track_anchor(
+                        cam_mat_curr, centroid_to, object_anchor_local,
+                        self.get_target_rotation_quaternion(target), init_t_scale, scale_ratio,
+                    )
                 target.scale = init_t_scale
             else: # CAMERA
                 scale_ratio = scale_ratio_cam if scale_ratio_cam > 1e-6 else 1.0
@@ -1290,7 +1265,7 @@ class PCamPointSolver:
                 keep_existing_focal or
                 props.scale_mode == 'Z_DEPTH'
             ):
-                if props.scale_mode == 'Z_DEPTH' and props.lock_camera_z:
+                if props.scale_mode == 'Z_DEPTH' and props.lock_camera_z and not keep_existing_position:
                     target.location.z = init_t_loc.z
                 fallback_quat = self.get_target_rotation_quaternion(target)
                 ray_origin_loc = init_t_loc
@@ -1308,6 +1283,7 @@ class PCamPointSolver:
                     fallback_quat,
                     props.clip_lock_roll,
                     prefer_center=keep_existing_position,
+                    ray_focal_ratio=setup.follow_f_len / max(target.data.lens, 1e-6) if props.scale_mode == 'FOCAL_LENGTH' else 1.0,
                 )
                 if refined_quat is None:
                     refined_quat = fallback_quat

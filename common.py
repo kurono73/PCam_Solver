@@ -1357,7 +1357,7 @@ def solve_rotation_quat_at_location(points_world, rays_local, cam_loc, fallback_
         solved_quat = refine_rotation_center_alignment(solved_quat, desired_dirs, observed_rays, valid_weights)
     return solved_quat
 
-def solve_track_rotation_from_follow_points(track_names, fixed_world_points, current_world_points, cam_loc, ray_origin_loc, ray_origin_quat, fallback_quat, lock_roll=False, prefer_center=False):
+def solve_track_rotation_from_follow_points(track_names, fixed_world_points, current_world_points, cam_loc, ray_origin_loc, ray_origin_quat, fallback_quat, lock_roll=False, prefer_center=False, ray_focal_ratio=1.0):
     points_world = []
     rays_local = []
     for track_name in track_names:
@@ -1369,7 +1369,10 @@ def solve_track_rotation_from_follow_points(track_names, fixed_world_points, cur
         if ray_world.length_squared <= 1e-9:
             continue
         points_world.append(point_world)
-        rays_local.append((ray_origin_quat.inverted() @ ray_world).normalized())
+        ray_local = ray_origin_quat.inverted() @ ray_world
+        ray_local.x *= ray_focal_ratio
+        ray_local.y *= ray_focal_ratio
+        rays_local.append(ray_local.normalized())
 
     if len(points_world) < 2:
         return None
@@ -1435,6 +1438,15 @@ def object_location_from_local_anchor(anchor_world, anchor_local, rotation_quat,
         anchor_local.z * scale.z,
     ))
     return anchor_world - (rotation_quat.to_matrix() @ scaled_local)
+
+def object_location_from_scaled_track_anchor(camera_matrix, anchor_world, anchor_local, rotation_quat, scale, track_scale):
+    # Correct the tracked centroid along its viewing ray before restoring the
+    # object's origin offset. Moving the origin along the optical axis slides it.
+    corrected_anchor = anchor_world.copy()
+    if track_scale is not None and track_scale > 1e-6:
+        camera_location = camera_matrix.translation
+        corrected_anchor = camera_location + (anchor_world - camera_location) / track_scale
+    return object_location_from_local_anchor(corrected_anchor, anchor_local, rotation_quat, scale)
 
 # --- Lightweight Smoothing Helpers ---
 
