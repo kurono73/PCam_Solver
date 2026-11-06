@@ -29,6 +29,10 @@ def pcam_get_track_pool(props):
 def pcam_bake_result_message(label, target_name, baked_frames, total_frames):
     return f"Baked {label} to '{target_name}': {baked_frames}/{total_frames} frames."
 
+
+def pcam_camera_collection(context, camera):
+    return camera.users_collection[0] if camera.users_collection else context.scene.collection
+
 def pcam_get_bake_block_reason(context, props):
     if not props.target_clip:
         return "Movie Clip is required."
@@ -37,6 +41,13 @@ def pcam_get_bake_block_reason(context, props):
         return "Active Camera is required."
     if props.apply_to == 'OBJECT' and not props.target_object:
         return "Target Object is required."
+    if props.mode == 'PLANE_TRACK':
+        track_pool = pcam_get_track_pool(props)
+        if track_pool is None:
+            return "Track Layer is invalid."
+        tracking_object = props.target_clip.tracking.objects[int(props.tracking_object_idx)]
+        if not props.plane_track_name or tracking_object.plane_tracks.get(props.plane_track_name) is None:
+            return "Plane Track is required."
     if (
         props.apply_to == 'CAMERA' and
         props.mode in {'ONE_POINT', 'TWO_POINT', 'THREE_POINT'} and
@@ -55,6 +66,8 @@ def pcam_get_bake_block_reason(context, props):
         return "Track Layer is invalid."
 
     if props.mode == 'CLIP_TRACK':
+        if props.clip_3d_solve and len(track_pool) < 4:
+            return "3D Solve requires at least four tracks."
         if len(track_pool) == 0:
             return "At least one tracker is required."
         return ""

@@ -2,6 +2,7 @@
 from .common import *
 from .operators_misc import OBJECT_OT_set_pcam_solve_bake_start, OBJECT_OT_set_pcam_solve_bake_end, OBJECT_OT_get_pcam_solve_selected_tracks, OBJECT_OT_add_pcam_solve_depth_plane
 from .operators_apply import OBJECT_OT_apply_tracking_data
+from .solver_plane import PCAM_OT_align_plane_track
 
 class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
     bl_label = "Pseudo Camera Solver"
@@ -13,6 +14,7 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
         layout = self.layout
         props = context.scene.pcam_solve_props
         is_cam = props.apply_to == 'CAMERA'
+        is_plane = props.mode == 'PLANE_TRACK'
         capabilities = pcam_get_solve_capabilities(props)
 
         def labeled_prop(container, data, prop_name, label, factor=0.42):
@@ -47,12 +49,19 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
         split = row.split(factor=0.42, align=True)
         split.label(text="Movie Clip")
         split.prop(props, "target_clip", text="")
-        if props.mode != 'CLIP_TRACK':
+        if props.mode in {'ONE_POINT', 'TWO_POINT', 'THREE_POINT'}:
             row.operator(OBJECT_OT_get_pcam_solve_selected_tracks.bl_idname, text="", icon='FILE_REFRESH')
         
         if props.target_clip: 
             labeled_prop(b_track, props, "tracking_object_idx", "Track Layer")
              
+            if is_plane:
+                try:
+                    plane_pool = props.target_clip.tracking.objects[int(props.tracking_object_idx)]
+                except (IndexError, ValueError):
+                    plane_pool = None
+                if plane_pool:
+                    b_track.prop_search(props, "plane_track_name", plane_pool, "plane_tracks", text="Plane Track")
             if capabilities.uses_follow_track:
                 b_track.prop(props, "use_undistort")
                 tr = b_track.box()
@@ -79,34 +88,102 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             row_colors.prop(props, "preview_color_miss", text="")
             row_colors.prop(props, "preview_color_line", text="")
 
+        if is_plane:
+            b_plane = layout.box()
+            b_plane.label(text="Plane Setup", icon='MESH_PLANE')
+            if is_cam:
+                labeled_prop(b_plane, props, "plane_alignment", "Alignment")
+            else:
+                split = b_plane.split(factor=0.42, align=True)
+                split.label(text="Alignment")
+                split.label(text="Camera", icon='CAMERA_DATA')
+            size_split = b_plane.split(factor=0.30, align=True)
+            size_split.label(text="Size")
+            size_controls = size_split.row(align=True)
+            size_controls.prop(props, "plane_size_mode", text="")
+            if props.plane_size_mode == 'HEIGHT':
+                size_controls.prop(props, "plane_size", text="")
+            elif props.plane_size_mode == 'WIDTH':
+                size_controls.prop(props, "plane_width", text="")
+            else:
+                dimensions = b_plane.row(align=True)
+                dimensions.prop(props, "plane_width", text="Width")
+                dimensions.prop(props, "plane_size", text="Height")
+            align_row = b_plane.row(align=True)
+            align_controls = align_row.split(factor=0.87, align=True) if is_cam else align_row
+            op = align_controls.operator(PCAM_OT_align_plane_track.bl_idname,
+                                    text="Align Camera & Plane" if is_cam else "Align Plane to Track",
+                                    icon='CON_TRACKTO')
+            op.alignment = props.plane_alignment if is_cam else 'CAMERA'
+            op.size = props.plane_size
+            op.width = props.plane_width
+            op.size_mode = props.plane_size_mode
+            op.auto_lens = is_cam and props.plane_size_mode == 'DIMENSIONS' and props.plane_auto_lens
+            if is_cam:
+                lens_row = align_controls.row(align=True)
+                lens_row.enabled = props.plane_size_mode == 'DIMENSIONS'
+                lens_row.prop(props, "plane_auto_lens", text="", icon='CAMERA_DATA', toggle=True)
         b_opt = layout.box()
         b_opt.label(text="Solve Settings", icon='TOOL_SETTINGS')
+        if props.mode == 'CLIP_TRACK':
+            labeled_prop(b_opt, props, "clip_solve_method", "Scale Method")
         tripod_label = "Dolly Motion" if props.mode != 'ONE_POINT' and props.scale_mode == 'Z_DEPTH' else "Tripod"
-        if props.mode != 'ONE_POINT':
+        if props.mode in {'TWO_POINT', 'THREE_POINT'}:
             if is_cam:
                 labeled_prop(b_opt, props, "scale_mode", "Scale Method")
             else:
                 b_opt.label(text="Scale mapped to Z-Depth.")
 
-        if props.mode == 'CLIP_TRACK':
-            if is_cam:
-                row = b_opt.row(align=True)
-                row.prop(props, "tripod_mode", text=tripod_label)
-                if props.scale_mode == 'NONE':
-                    row.prop(props, "clip_lock_roll", text="Lock Roll")
-                if not props.tripod_mode and props.scale_mode == 'Z_DEPTH':
-                    height_control = row.row(align=True)
-                    height_control.enabled = not pcam_use_existing_position(props)
-                    height_control.prop(props, "lock_camera_z", text="Lock Height")
-
-                row = b_opt.row(align=True)
-                row.prop(props, "track_smoothing", text="Smooth Jitter")
-                row.prop(props, "clip_center_weight", text="Center Weighting")
+        if is_plane and is_cam:
+            labeled_prop(b_opt, props, "plane_solve_mode", "Solve Method")
+            if props.plane_solve_mode == 'FOCAL_LENGTH':
+                tripod_row = b_opt.row(align=True)
+                tripod_row.enabled = not pcam_use_existing_position(props)
+                tripod_row.prop(props, "plane_tripod", text="Tripod")
+                if not props.plane_tripod and not pcam_use_existing_position(props):
+                    b_opt.prop(props, "clip_position_smooth", text="Position Smooth")
+                b_opt.prop(props, "clip_focal_smooth", text="Focal Smooth")
             else:
                 row = b_opt.row(align=True)
-                row.prop(props, "track_smoothing", text="Smooth Jitter")
-                row = b_opt.row(align=True)
-                row.prop(props, "clip_center_weight", text="Center Weighting")
+                height_row = row.row(align=True)
+                height_row.enabled = not pcam_use_existing_position(props)
+                height_row.prop(props, "lock_camera_z", text="Lock Height")
+                b_opt.prop(props, "clip_position_smooth", text="Position Smooth")
+            row = b_opt.row(align=True)
+            row.prop(props, "solve_3d_rotation_smooth", text="Rotation Smooth")
+        elif is_plane:
+            b_opt.prop(props, "clip_position_smooth", text="Position Smooth")
+            b_opt.prop(props, "solve_3d_rotation_smooth", text="Rotation Smooth")
+        elif props.mode == 'CLIP_TRACK':
+            if is_cam:
+                if props.clip_3d_solve:
+                    height_row = b_opt.row(align=True)
+                    height_row.enabled = not pcam_use_existing_position(props)
+                    height_row.prop(props, "lock_camera_z", text="Lock Height")
+                    b_opt.prop(props, "clip_position_smooth", text="Position Smooth")
+                    b_opt.prop(props, "solve_3d_rotation_smooth", text="Rotation Smooth")
+                else:
+                    row = b_opt.row(align=True)
+                    row.prop(props, "tripod_mode", text=tripod_label)
+                    if props.scale_mode == 'NONE':
+                        row.prop(props, "clip_lock_roll", text="Lock Roll")
+                    if not props.tripod_mode and props.scale_mode == 'Z_DEPTH':
+                        height_control = row.row(align=True)
+                        height_control.enabled = not pcam_use_existing_position(props)
+                        height_control.prop(props, "lock_camera_z", text="Lock Height")
+
+                    row = b_opt.row(align=True)
+                    row.prop(props, "track_smoothing", text="Smooth Jitter")
+                    row.prop(props, "clip_center_weight", text="Center Weighting")
+            else:
+                if props.clip_3d_solve:
+                    b_opt.prop(props, "clip_position_smooth", text="Position Smooth")
+                    b_opt.prop(props, "solve_3d_rotation_smooth", text="Rotation Smooth")
+                else:
+                    row = b_opt.row(align=True)
+                    row.prop(props, "track_smoothing", text="Smooth Jitter")
+                    row = b_opt.row(align=True)
+                    row.prop(props, "clip_center_weight", text="Center Weighting")
              
         elif props.mode == 'ONE_POINT':
             if is_cam:
@@ -130,7 +207,7 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             else:
                 b_opt.prop(props, "track_smoothing", text="Smooth Jitter")
 
-        if props.mode == 'CLIP_TRACK' and is_cam:
+        if props.mode == 'CLIP_TRACK' and is_cam and not props.clip_3d_solve:
             b_opt.prop(props, "clip_position_smooth", text="Position Smooth")
             if props.scale_mode == 'FOCAL_LENGTH':
                 b_opt.prop(props, "clip_focal_smooth", text="Focal Smooth")
@@ -162,12 +239,12 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             row = b_bake.row(align=True)
             row.enabled = existing_position_supported
             row.prop(props, "clip_use_existing_position", text="Use Existing Position")
-        elif props.mode == 'CLIP_TRACK' and is_cam:
+        elif props.mode in {'CLIP_TRACK', 'PLANE_TRACK'} and is_cam:
             row = b_bake.row(align=True)
             pos_row = row.row(align=True)
             pos_row.enabled = existing_position_supported
             pos_row.prop(props, "clip_use_existing_position", text="Use Existing Position")
-            if capabilities.existing_focal_supported:
+            if capabilities.existing_focal_supported and not props.clip_3d_solve:
                 row.prop(props, "clip_use_existing_focal", text="Use Existing Focal")
         elif props.mode in {'TWO_POINT', 'THREE_POINT'} and is_cam:
             row = b_bake.row(align=True)

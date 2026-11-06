@@ -4,8 +4,9 @@ from .animation_io import PCamAnimationIO
 from .solver_clip import PCamClipTrackSolver
 from .follow_track import PCamFollowTrackMixin
 from .solver_points import PCamPointSolver
+from .solver_plane import PCamPlaneSolver
 
-class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, PCamFollowTrackMixin, PCamPointSolver, bpy.types.Operator):
+class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, PCamFollowTrackMixin, PCamPointSolver, PCamPlaneSolver, bpy.types.Operator):
     bl_idname = "view3d.pcam_solve_apply_tracking_data"
     bl_label = "Bake Tracking to Target"
     bl_options = {'REGISTER', 'UNDO'}
@@ -100,7 +101,13 @@ class OBJECT_OT_apply_tracking_data(PCamAnimationIO, PCamClipTrackSolver, PCamFo
             self.report({'WARNING'}, f"Use Existing Position ignored: {existing_position_reason}")
              
         if props.mode == 'CLIP_TRACK':
-            result = self.execute_clip_track(context, target)
+            if props.clip_3d_solve:
+                result = (self.execute_clip_track_3d(context, target) if props.apply_to == 'CAMERA'
+                          else self.execute_clip_track_object_3d(context, target))
+            else:
+                result = self.execute_clip_track(context, target)
+        elif props.mode == 'PLANE_TRACK':
+            result = self.execute_plane_track(context, target)
         elif props.mode == 'ONE_POINT':
             result = self.execute_one_point(context, target)
         elif props.mode == 'TWO_POINT':

@@ -2,6 +2,36 @@
 from .common import *
 from .preview import update_track_preview, update_custom_range_preview, update_existing_position_lock, update_reference_frame_lock
 
+_CLIP_CAMERA_METHODS = [
+    ('Z_DEPTH', "Z-Depth", "Convert apparent scale to depth movement", 0),
+    ('FOCAL_LENGTH', "Focal Length", "Convert apparent scale to focal length animation", 1),
+    ('NONE', "None", "Ignore apparent scale change", 2),
+    ('THREE_D', "3D Solve", "Fit 3D camera motion from at least four Depth Reference hits", 3),
+]
+_CLIP_OBJECT_METHODS = [
+    ('Z_DEPTH', "Z-Depth", "Use the standard depth-aware object solve", 0),
+    ('THREE_D', "3D Solve", "Fit 3D object motion from at least four Depth Reference hits", 3),
+]
+
+
+def _clip_solve_method_items(self, context):
+    return _CLIP_CAMERA_METHODS if self.apply_to == 'CAMERA' else _CLIP_OBJECT_METHODS
+
+
+def _get_clip_solve_method(self):
+    if self.clip_3d_solve:
+        return 3
+    if self.apply_to == 'OBJECT':
+        return 0
+    return {'Z_DEPTH': 0, 'FOCAL_LENGTH': 1, 'NONE': 2}.get(self.scale_mode, 0)
+
+
+def _set_clip_solve_method(self, value):
+    self.clip_3d_solve = value == 3
+    if value != 3:
+        self.scale_mode = {0: 'Z_DEPTH', 1: 'FOCAL_LENGTH', 2: 'NONE'}[value]
+
+
 class PCamSolveProperties(bpy.types.PropertyGroup):
     apply_to: bpy.props.EnumProperty(
         name="Apply To",
@@ -20,6 +50,7 @@ class PCamSolveProperties(bpy.types.PropertyGroup):
             ('TWO_POINT', "2 Point Track", "Use two tracked points for motion, scale, and roll estimation"),
             ('THREE_POINT', "3 Point Track", "Use three tracked points for a more stable 3D-style solve"),
             ('CLIP_TRACK', "Clip Track", "Use all available tracks in the selected tracking layer for a clip-wide solve"),
+            ('PLANE_TRACK', "Plane Track", "Solve a camera from a tracked quadrilateral and an aligned 3D plane"),
         ],
         default='TWO_POINT',
     )
@@ -48,6 +79,77 @@ class PCamSolveProperties(bpy.types.PropertyGroup):
     track_1: bpy.props.StringProperty(name="Track 1", description="Primary track used by 1-point, 2-point, or 3-point solving")
     track_2: bpy.props.StringProperty(name="Track 2", description="Second track used by 2-point and 3-point solving")
     track_3: bpy.props.StringProperty(name="Track 3", description="Third track used by 3-point solving")
+    plane_track_name: bpy.props.StringProperty(
+        name="Plane Track",
+        description="Plane track whose four corners define the reference surface",
+    )
+    plane_alignment: bpy.props.EnumProperty(
+        name="Alignment",
+        description="Choose what stays fixed while aligning the plane track",
+        items=[('WALL', "Wall", "Place a vertical plane at the origin and align the camera to it"),
+               ('FLOOR', "Floor", "Place a horizontal plane at the origin and align the camera to it"),
+               ('CAMERA', "Camera", "Keep the current camera position and rotation; align the plane to the tracked corners")],
+        default='WALL',
+    )
+    plane_size: bpy.props.FloatProperty(
+        name="Plane Height",
+        description="Height of the Plane Track reference in scene units",
+        default=2.0,
+        min=0.01,
+        unit='LENGTH',
+    )
+    plane_width: bpy.props.FloatProperty(
+        name="Plane Width",
+        description="Width of the Plane Track reference in scene units",
+        default=2.0,
+        min=0.01,
+        unit='LENGTH',
+    )
+    plane_size_mode: bpy.props.EnumProperty(
+        name="Size Mode",
+        description="Choose which physical dimensions of the Plane Track reference are specified",
+        items=[('HEIGHT', "Height", "Specify height; infer width from the tracked plane"),
+               ('WIDTH', "Width", "Specify width; infer height from the tracked plane"),
+               ('DIMENSIONS', "Dimensions", "Specify both width and height; fit the pose to the tracked corners")],
+        default='HEIGHT',
+    )
+    plane_auto_lens: bpy.props.BoolProperty(
+        name="Auto Lens",
+        description="Estimate the camera focal length from the tracked corners and known plane width and height; available only with Dimensions",
+        default=False,
+    )
+    plane_solve_mode: bpy.props.EnumProperty(
+        name="Solve Method",
+        description="Choose whether Plane Track scale change drives 3D position or focal length",
+        items=[('3D_POSITION', "3D Position", "Solve camera position and rotation using the existing focal length"),
+               ('FOCAL_LENGTH', "Focal Length", "Keep the camera position fixed or use its existing curve; solve rotation and focal length from the plane corners")],
+        default='3D_POSITION',
+    )
+    plane_tripod: bpy.props.BoolProperty(
+        name="Tripod",
+        description="Keep the camera at its Reference Frame position while solving rotation and focal length; turn off to allow movement parallel to the plane. Use Existing Position takes priority",
+        default=True,
+    )
+    clip_3d_solve: bpy.props.BoolProperty(
+        name="3D Solve",
+        description="Fit 3D camera or object motion from four or more visible tracks using the Depth Reference; overlapping tracks keep the solve continuous when tracks change",
+        default=False,
+    )
+    clip_solve_method: bpy.props.EnumProperty(
+        name="Scale Method",
+        description="Choose how Clip Track motion and scale changes are solved",
+        items=_clip_solve_method_items,
+        get=_get_clip_solve_method,
+        set=_set_clip_solve_method,
+    )
+    solve_3d_rotation_smooth: bpy.props.FloatProperty(
+        name="Rotation Smooth",
+        description="Smooth the solved 3D camera rotation after fitting the tracked points",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
 
     use_reference_frame_lock: bpy.props.BoolProperty(
         name="Lock Reference Frame",
@@ -127,7 +229,7 @@ class PCamSolveProperties(bpy.types.PropertyGroup):
     )
     clip_focal_smooth: bpy.props.FloatProperty(
         name="Focal Smooth",
-        description="Smooth the solved focal length curve for Clip Track",
+        description="Smooth the solved focal length curve before rotation is refitted",
         default=0.0,
         min=0.0,
         max=1.0,

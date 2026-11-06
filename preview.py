@@ -3,6 +3,7 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 
 from .common import *
+from .solver_plane import _depth_hit
 
 _handle_3d = None
 
@@ -49,29 +50,41 @@ def draw_trackers_callback():
     elif props.mode == 'THREE_POINT':
         selected_names = [props.track_1, props.track_2, props.track_3]
 
-    for t in ob.tracks:
-        if props.mode != 'CLIP_TRACK' and t.name not in selected_names:
-            continue
-            
-        m = t.markers.find_frame(f_clip)
-        if m and not getattr(m, 'mute', False):
-            marker_co = get_track_display_co(t, m)
-            v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y, cam_eval.data)
-            v_world = cam_mat.to_3x3() @ v_cam
-            hit_loc = None
-            if obj_eval:
-                dir_loc = (mat_inv.to_3x3() @ v_world).normalized()
-                success, loc, normal, face_index = obj_eval.ray_cast(ray_origin, dir_loc)
-                if success:
-                    hit_loc = obj_eval.matrix_world @ loc
+    marker_positions = []
+    if props.mode == 'PLANE_TRACK':
+        plane = ob.plane_tracks.get(props.plane_track_name)
+        marker = plane.markers.find_frame(f_clip, exact=True) if plane else None
+        if marker:
+            marker_positions = [Vector(marker.corners[index]) for index in (3, 2, 1, 0)]
+    else:
+        for track in ob.tracks:
+            if props.mode != 'CLIP_TRACK' and track.name not in selected_names:
+                continue
+            marker = track.markers.find_frame(f_clip)
+            if marker and not getattr(marker, 'mute', False):
+                marker_positions.append(get_track_display_co(track, marker))
+
+    for marker_co in marker_positions:
+        v_cam = marker_to_camera_ray(marker_co, tan_x, tan_y, cam_eval.data)
+        v_world = cam_mat.to_3x3() @ v_cam
+        hit_loc = None
+        if obj_eval:
+            dir_loc = (mat_inv.to_3x3() @ v_world).normalized()
+            success, loc, normal, face_index = obj_eval.ray_cast(ray_origin, dir_loc)
+            if success:
+                hit_loc = obj_eval.matrix_world @ loc
+                points_hit.append(hit_loc)
+            elif props.mode == 'PLANE_TRACK' or (props.mode == 'CLIP_TRACK' and props.clip_3d_solve):
+                hit_loc = _depth_hit(context, cam_eval, cam_mat, depth_obj, marker_co, cam_eval.data.lens)
+                if hit_loc is not None:
                     points_hit.append(hit_loc)
-            if hit_loc is None:
-                hit_loc = origin + v_world * 5.0
-                if obj_eval is None and not pcam_depth_reference_required(props):
-                    points_hit.append(hit_loc)
-                else:
-                    points_miss.append(hit_loc)
-            lines.extend([origin, hit_loc])
+        if hit_loc is None:
+            hit_loc = origin + v_world * 5.0
+            if obj_eval is None and not pcam_depth_reference_required(props):
+                points_hit.append(hit_loc)
+            else:
+                points_miss.append(hit_loc)
+        lines.extend([origin, hit_loc])
             
     if not lines:
         return

@@ -25,13 +25,18 @@ def pcam_get_solve_capabilities(props):
         'TWO_POINT': 2,
         'THREE_POINT': 3,
         'CLIP_TRACK': 0,
+        'PLANE_TRACK': 0,
     }.get(mode, 1)
     uses_follow_track = mode in {'ONE_POINT', 'TWO_POINT', 'THREE_POINT'}
 
     if mode == 'ONE_POINT':
         depth_required = not tripod
+    elif mode == 'PLANE_TRACK':
+        depth_required = True
     elif mode in {'TWO_POINT', 'THREE_POINT', 'CLIP_TRACK'}:
         if not is_camera:
+            depth_required = True
+        elif mode == 'CLIP_TRACK' and props.clip_3d_solve:
             depth_required = True
         elif scale_mode == 'NONE':
             depth_required = not tripod
@@ -49,14 +54,15 @@ def pcam_get_solve_capabilities(props):
     elif rotation_only_tripod:
         existing_position_supported = False
         existing_position_reason = "Unavailable in rotation-only Tripod mode."
-    elif mode in {'TWO_POINT', 'THREE_POINT', 'CLIP_TRACK'} and tripod and scale_mode == 'FOCAL_LENGTH':
+    elif mode in {'TWO_POINT', 'THREE_POINT', 'CLIP_TRACK'} and tripod and scale_mode == 'FOCAL_LENGTH' and not (mode == 'CLIP_TRACK' and props.clip_3d_solve):
         existing_position_supported = False
         existing_position_reason = "Unavailable with Tripod + Focal Length."
 
     existing_focal_supported = (
         is_camera and
         mode in {'TWO_POINT', 'THREE_POINT', 'CLIP_TRACK'} and
-        scale_mode == 'FOCAL_LENGTH'
+        scale_mode == 'FOCAL_LENGTH' and
+        not (mode == 'CLIP_TRACK' and props.clip_3d_solve)
     )
     existing_focal_required_with_position = (
         existing_position_supported and

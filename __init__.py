@@ -9,6 +9,7 @@ from .operators_misc import (
     OBJECT_OT_add_pcam_solve_depth_plane,
 )
 from .operators_apply import OBJECT_OT_apply_tracking_data
+from .solver_plane import PCAM_OT_align_plane_track
 from .ui import VIEW3D_PT_pcam_solve_panel
 from .preview import remove_preview_handler
 
@@ -18,6 +19,7 @@ classes = (
     OBJECT_OT_set_pcam_solve_bake_end,
     OBJECT_OT_get_pcam_solve_selected_tracks,
     OBJECT_OT_add_pcam_solve_depth_plane,
+    PCAM_OT_align_plane_track,
     OBJECT_OT_apply_tracking_data,
     VIEW3D_PT_pcam_solve_panel,
 )

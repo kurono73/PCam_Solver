@@ -136,7 +136,7 @@ class OBJECT_OT_add_pcam_solve_depth_plane(bpy.types.Operator):
         )
         mesh.update()
         plane = bpy.data.objects.new("PCam_Depth_Reference", mesh)
-        context.scene.collection.objects.link(plane)
+        pcam_camera_collection(context, cam).objects.link(plane)
         bpy.ops.object.select_all(action='DESELECT')
         plane.select_set(True)
         context.view_layer.objects.active = plane
