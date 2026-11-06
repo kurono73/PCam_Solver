@@ -34,7 +34,7 @@ PCamSolver is **not** intended to replace a full camera solve when sufficient tr
 
 It is less suitable for:
 
-* Shots with many  feature points where Blender's standard camera solver works well.
+* Shots with many feature points where Blender's standard camera solver works well.
 * Shots with large camera movement.
 * Shots with strong parallax that require true 3D camera reconstruction.
 
@@ -63,7 +63,19 @@ The tracked points remain fixed reference targets while the camera or object ori
 
 Clip Track mode uses many available movie clip tracks directly.
 
-It is intended for shots with more tracking points and provides a broader pseudo solve with optional smoothing and rotation refinement.
+Its standard solve supports tracks that appear and disappear, with optional smoothing and rotation refinement. For Camera targets, `Scale Method: Focal Length` converts apparent scale change into lens animation.
+
+`Scale Method: 3D Solve` fits Camera or Object motion from at least four visible tracks on the Depth Reference. It uses the camera's existing lens value at each frame rather than estimating zoom. Track changes are supported when enough tracks overlap to carry the solve forward.
+
+### Plane Track
+
+Plane Track mode uses the four corners of a Blender Plane Track to solve a Camera or Object against a four-corner Depth Reference plane. It is suited to tracked flat surfaces such as screens and walls.
+
+**Plane Setup** aligns on the current timeline frame. For Camera targets, `Alignment: Wall` and `Floor` place the plane at the world origin and align the camera; `Camera` preserves the camera pose and aligns the plane instead. For Object targets, the camera pose is preserved and the plane is aligned to the track. Aligning again updates a selected `PCam_Plane` rather than adding another one. Alignment updates keys already present on that frame but does not add new keys.
+
+The plane size can be specified by `Height`, `Width`, or `Dimensions`. With one dimension, the other is inferred from the tracked plane. `Dimensions` keeps both supplied values and refits the pose to the four corners. In Camera mode, optional **Auto Lens** beside **Align Camera & Plane** estimates the focal length from known width and height; it is unavailable with a single specified dimension. If the four corners do not constrain the estimate reliably, alignment stops without changing the lens.
+
+For Camera targets, `Solve Method: 3D Position` solves camera position and rotation with the existing lens animation. `Focal Length` solves rotation and lens animation relative to the Reference Frame's lens value. With `Tripod` on, camera position stays fixed; with it off, the camera can move parallel to the reference plane while its depth remains fixed. **Use Existing Position** takes priority over `Tripod` and preserves the position curve. For Object targets, Plane Track bakes object motion using the scene camera and its existing animation. If no Target Object is selected, **Align Plane to Track** assigns the aligned Depth Reference plane as the target.
 
 ### Depth Reference
 
@@ -91,49 +103,57 @@ In **Focal Length** mode, the lens value on the **Reference Frame** becomes the 
    * `2 Point Track` – Adds scale and roll estimation from two trackers.
    * `3 Point Track` – Provides a more stable pseudo 3D solve.
    * `Clip Track` – Uses many movie clip tracks for a broader solve.
+   * `Plane Track` – Uses the four corners of a Plane Track to fit Camera or Object motion to a flat surface.
 
 4. Choose whether to bake to the active `Camera` or a target `Object`.
 
-5. Select the Movie Clip, tracking object, and required tracks.
+5. Select the Movie Clip, track layer, and required tracks or Plane Track.
 
-   **Get Selected Tracks** automatically fills the track fields from the selected Movie Clip tracks.
+   **Get Selected Tracks** automatically fills the point-track fields in 1/2/3 Point modes.
 
 6. Set a **Depth Reference** when required.
 
-   This is usually a plane or object placed near the tracked surface. The `+` button creates a camera-facing Depth Reference Plane.
+   This is usually a plane or object placed near the tracked surface. The `+` button creates a camera-facing Depth Reference Plane in the active camera's collection.
 
-7. Choose a **Scale Method**:
+   In Plane Track mode, use **Plane Setup** to choose `Alignment` and size, then click **Align Camera & Plane** (or **Align Plane to Track** for Object targets). `Height` and `Width` infer the unspecified dimension; `Dimensions` uses both supplied values. In Camera mode, turn on **Auto Lens** beside the Align button to estimate focal length from `Dimensions`. Align uses the current timeline frame. For Object targets, the aligned plane becomes the Target Object only if none is selected.
+
+7. For Camera targets in 2/3 Point or Clip Track, choose a **Scale Method**:
 
    * `Z-Depth` – Converts apparent scale changes into movement along the camera's depth axis.
    * `Focal Length` – Converts apparent scale changes into focal length animation.
    * `None` – Ignores scale changes and solves only rotation and position. This behaves similarly to Blender's standard **Tripod Solve**, but uses a simpler solving method.
 
+   In Clip Track, `3D Solve` is another Scale Method. It fits Camera or Object motion from four or more tracks on the Depth Reference using the existing lens animation. Object targets offer `Z-Depth` and `3D Solve`.
+
+   Plane Track Camera mode instead offers `Solve Method: 3D Position` or `Focal Length`.
+
 8. Adjust the solve settings if needed:
 
-   * `Tripod` – Solves rotation without translating the camera. Useful for tripod shots or nearly stationary cameras.
+   * `Tripod` – In Plane Track `Focal Length`, ON keeps the camera at its Reference Frame position; OFF allows movement parallel to the plane while solving rotation and zoom. **Use Existing Position** overrides this setting. Other modes retain their existing Tripod behavior.
    * `Dolly Motion` – In `Z-Depth` mode, converts apparent scale changes into camera movement along the depth axis.
    * `Lock Height` – Keeps the camera height fixed while solving horizontal movement and rotation.
    * `Smooth Jitter` – Smooths tracker motion before solving.
    * `Center Weighting` – Gives more influence to tracks near the image center.
    * `Lock Roll` – Available in **2 Point** and **3 Point** modes to prevent roll rotation.
-   * Clip Track smoothing controls can smooth position, focal length, pan/tilt, and roll after baking.
+   * Plane Track `Focal Smooth`, `Position Smooth`, and `Rotation Smooth` appear only where applicable to the selected solve method and target.
+   * Standard Clip Track smoothing controls can smooth position, focal length, pan/tilt, and roll during the solve.
 
 9. Set the **Reference Frame**.
 
-   The current frame is used by default. You can also lock a specific Reference Frame to produce repeatable results.
+   The current frame is used by default. You can also lock a specific Reference Frame to produce repeatable results. Plane Track alignment uses the active frame; when the Reference Frame is locked, alignment updates it to that frame.
 
 10. Optional settings:
 
-* `Custom Range` – Bake only part of the clip.
-* `Use Existing Position` – Keep existing position animation and recompute only rotation.
-* `Use Existing Focal` – Keep existing focal length animation.
-* `Preview Tracker Raycast` – Visualize where tracker rays intersect the Depth Reference.
+   * `Custom Range` – Bake only part of the clip while preserving keys outside that range.
+   * `Use Existing Position` – Keep existing position animation and solve the remaining channels where supported. In Plane Track `Focal Length`, it keeps position while solving rotation and lens animation.
+   * `Use Existing Focal` – Keep existing focal length animation where this option is available.
+   * `Preview Tracker Raycast` – Visualize where tracker rays intersect the Depth Reference.
 
 11. Click `Bake Tracking to Target`.
 
 12. Review the baked animation in the Viewport and Graph Editor.
 
-If necessary, smooth or edit the baked curves manually. You can then use `Use Existing Position` or `Use Existing Focal` to recalculate only the remaining motion channels while preserving the edited animation.
+If necessary, smooth or edit the baked curves manually. Where supported, `Use Existing Position` and `Use Existing Focal` let you refit the remaining channels while preserving those edits.
 
 ---
 
@@ -141,11 +161,14 @@ If necessary, smooth or edit the baked curves manually. You can then use `Use Ex
 
 * PCamSolver is a pseudo solve tool. It is not a full 3D camera reconstruction system.
 * Before baking, roughly align the camera position and rotation on the **Reference Frame**. This usually produces more predictable results.
-* PCamSolver does not estimate the real camera focal length or lens parameters. Set the camera focal length and sensor settings before baking.
+* PCamSolver does not generally calibrate the camera's base focal length or sensor parameters. Set them before baking; an incorrect field of view can increase solve error. Plane Track **Auto Lens** is an optional single-frame estimate when both plane dimensions are known, not a full lens calibration. Check its result against the footage.
 * In **Focal Length** mode, the focal length on the **Reference Frame** is used as the base value for the solved animation.
 * In **1/2/3 Point** camera modes, the camera cannot be exactly at the world origin. Move the camera slightly away from `(0, 0, 0)` before baking.
 * In **1/2/3 Point** modes, the selected trackers should remain valid throughout the bake range.
 * If trackers appear or disappear during the shot, consider using **Clip Track** mode. You can also solve shorter sections with **Custom Range** and use different trackers for each section.
+* **Plane Track** requires valid tracked corners over the frames you want to solve. Align the plane on the intended Reference Frame before baking. In `Dimensions` mode, a supplied aspect ratio that conflicts with the tracked corners will leave a reprojection mismatch.
+* Clip Track **3D Solve** needs at least four Depth Reference hits on the Reference Frame and four usable tracks to fit a frame. Frames without enough information hold the previous solved relative pose; overlapping tracks help when trackers change. After baking, a warning lists the frame ranges where the previous pose was held.
+* In Plane Track Object mode, position the target object as desired on the Reference Frame before baking. Its initial offset from the Depth Reference is preserved.
 * **Preview Tracker Raycast** is intended to help place the **Depth Reference**. It does not display undistorted tracker positions.
 * Make sure the **Depth Reference** covers the full movement range of the trackers used for the solve. A simple plane usually provides the most stable and predictable results.
 * In Object mode, animated rotation on the **Depth Reference** can be used as a simple guide for depth-related object rotation. Use **Preview Tracker Raycast** to verify that tracker rays remain inside the Depth Reference. Large rotations or insufficient coverage may produce unstable results.
