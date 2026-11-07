@@ -110,7 +110,7 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
                 dimensions.prop(props, "plane_width", text="Width")
                 dimensions.prop(props, "plane_size", text="Height")
             align_row = b_plane.row(align=True)
-            align_controls = align_row.split(factor=0.87, align=True) if is_cam else align_row
+            align_controls = align_row.split(factor=0.87, align=True)
             op = align_controls.operator(PCAM_OT_align_plane_track.bl_idname,
                                     text="Align Camera & Plane" if is_cam else "Align Plane to Track",
                                     icon='CON_TRACKTO')
@@ -118,11 +118,10 @@ class VIEW3D_PT_pcam_solve_panel(bpy.types.Panel):
             op.size = props.plane_size
             op.width = props.plane_width
             op.size_mode = props.plane_size_mode
-            op.auto_lens = is_cam and props.plane_size_mode == 'DIMENSIONS' and props.plane_auto_lens
-            if is_cam:
-                lens_row = align_controls.row(align=True)
-                lens_row.enabled = props.plane_size_mode == 'DIMENSIONS'
-                lens_row.prop(props, "plane_auto_lens", text="", icon='CAMERA_DATA', toggle=True)
+            op.auto_lens = props.plane_size_mode == 'DIMENSIONS' and props.plane_auto_lens
+            lens_row = align_controls.row(align=True)
+            lens_row.enabled = props.plane_size_mode == 'DIMENSIONS'
+            lens_row.prop(props, "plane_auto_lens", text="", icon='CAMERA_DATA', toggle=True)
         b_opt = layout.box()
         b_opt.label(text="Solve Settings", icon='TOOL_SETTINGS')
         if props.mode == 'CLIP_TRACK':

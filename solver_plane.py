@@ -549,10 +549,15 @@ class PCAM_OT_align_plane_track(PCamAnimationIO, bpy.types.Operator):
             context.scene.frame_set(frame)
             alignment = self.alignment if props.apply_to == 'CAMERA' else 'CAMERA'
             corners = _plane_corners(marker)
-            if self.auto_lens and (props.apply_to != 'CAMERA' or self.size_mode != 'DIMENSIONS'):
-                raise ValueError("Auto Lens requires Camera mode and Dimensions")
-            estimated_lens = (_estimate_plane_lens(context, camera, corners, self.width, self.size)
-                              if self.auto_lens else None)
+            if self.auto_lens and self.size_mode != 'DIMENSIONS':
+                raise ValueError("Auto Lens requires Dimensions")
+            estimated_lens = None
+            lens_estimate_failed = False
+            if self.auto_lens:
+                try:
+                    estimated_lens = _estimate_plane_lens(context, camera, corners, self.width, self.size)
+                except (ArithmeticError, ValueError):
+                    lens_estimate_failed = True
             camera_matrix, plane_matrix, width, height = _plane_layout(
                 context, camera, corners,
                 self.size if self.size_mode != 'WIDTH' else None,
@@ -576,8 +581,14 @@ class PCAM_OT_align_plane_track(PCamAnimationIO, bpy.types.Operator):
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
         plane = props.clip_depth_object
-        reuse = (plane is not None and plane.name.startswith("PCam_Plane") and
-                 plane.type == 'MESH' and len(plane.data.vertices) == 4)
+        reuse = plane is not None
+        if reuse and (plane.type != 'MESH' or len(plane.data.vertices) != 4 or
+                      not plane.data.polygons):
+            self.report({'ERROR'}, "Depth Reference must be a four-vertex mesh plane for Plane Track alignment.")
+            return {'CANCELLED'}
+        if reuse and (plane.library or plane.data.library):
+            self.report({'ERROR'}, "Linked Depth Reference cannot be edited for Plane Track alignment.")
+            return {'CANCELLED'}
         if reuse:
             if plane.data.users > 1:
                 plane.data = plane.data.copy()
@@ -590,12 +601,12 @@ class PCAM_OT_align_plane_track(PCamAnimationIO, bpy.types.Operator):
             mesh.update()
             plane = bpy.data.objects.new("PCam_Plane", mesh)
             pcam_camera_collection(context, camera).objects.link(plane)
+        if estimated_lens is not None:
+            camera.data.lens = estimated_lens
+            _update_existing_keys(self._iter_action_fcurves(camera.data), frame,
+                                  {'lens': estimated_lens})
         if props.apply_to == 'CAMERA':
             camera.matrix_world = camera_matrix
-            if estimated_lens is not None:
-                camera.data.lens = estimated_lens
-                _update_existing_keys(self._iter_action_fcurves(camera.data), frame,
-                                      {'lens': estimated_lens})
             rotation_path = ('rotation_quaternion' if camera.rotation_mode == 'QUATERNION' else
                              'rotation_axis_angle' if camera.rotation_mode == 'AXIS_ANGLE' else 'rotation_euler')
             values = {rotation_path: getattr(camera, rotation_path)}
@@ -618,7 +629,8 @@ class PCAM_OT_align_plane_track(PCamAnimationIO, bpy.types.Operator):
             props.reference_frame = frame
         _store_plane_alignment(plane, camera, frame)
         subject = "camera and plane" if props.apply_to == 'CAMERA' else "plane"
-        lens_note = f" Auto Lens: {estimated_lens:.2f} mm." if estimated_lens is not None else ""
+        lens_note = (f" Auto Lens: {estimated_lens:.2f} mm." if estimated_lens is not None else
+                     " Auto Lens unavailable; used existing lens." if lens_estimate_failed else "")
         target_note = " Set as Target Object." if assigned_target else ""
         self.report({'INFO'}, f"{'Updated' if reuse else 'Created'} '{plane.name}' and aligned {subject} on frame {frame}.{lens_note}{target_note}")
         return {'FINISHED'}
